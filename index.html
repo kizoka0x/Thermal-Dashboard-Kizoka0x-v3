@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>BTC Dashboard Thermique — Kizoka0x</title>
+
+  <!-- React 18 production -->
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+
+  <!-- Babel standalone -->
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+  <style>
+    /* ── Zoom 125% — équivalent Ctrl++ une fois ── */
+    html { zoom: 1.25; }
+    *, *::before, *::after { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      padding: 0;
+      background: #080c10;
+      font-family: Arial, sans-serif;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    /* ── Barre de progression refresh (haut de page) ── */
+    #refresh-bar {
+      position: fixed;
+      top: 0; left: 0;
+      height: 2px;
+      width: 0%;
+      background: linear-gradient(90deg, #58a6ff, #2ecc71);
+      z-index: 9999;
+      pointer-events: none;
+    }
+    #refresh-label {
+      position: fixed;
+      top: 4px; right: 8px;
+      font-size: 9px;
+      font-family: monospace;
+      color: rgba(88,166,255,.5);
+      z-index: 9999;
+      pointer-events: none;
+    }
+  </style>
+</head>
+<body>
+
+  <!-- Barre de progression -->
+  <div id="refresh-bar"></div>
+  <div id="refresh-label">⟳ 30:00</div>
+
+  <div id="root"></div>
+
+  <!-- App -->
+  <script type="text/babel" src="btc_thermal_ai.jsx"></script>
+
+  <!-- Auto-refresh 30 min avec countdown -->
+  <script>
+    const INTERVAL = 30 * 60 * 1000; // 30 min en ms
+    const bar      = document.getElementById('refresh-bar');
+    const lbl      = document.getElementById('refresh-label');
+    const start    = Date.now();
+
+    function pad(n) { return String(n).padStart(2,'0'); }
+
+    function tick() {
+      const elapsed = Date.now() - start;
+      const pct     = Math.min(elapsed / INTERVAL * 100, 100);
+      const remain  = Math.max(0, INTERVAL - elapsed);
+      const mm      = Math.floor(remain / 60000);
+      const ss      = Math.floor((remain % 60000) / 1000);
+      bar.style.width = pct + '%';
+      lbl.textContent = `⟳ ${pad(mm)}:${pad(ss)}`;
+    }
+
+    setInterval(tick, 1000);
+    tick();
+
+    // Rechargement complet de la page (→ force reload du JSON GitHub)
+    setTimeout(() => window.location.reload(), INTERVAL);
+  </script>
+
+</body>
+</html>

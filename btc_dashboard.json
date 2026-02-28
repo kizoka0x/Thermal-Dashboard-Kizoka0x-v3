@@ -1,0 +1,90 @@
+{
+  "updated": "2026-02-28T07:17",
+  "btcPrice": 63767.73,
+
+  "etf_30d_sum": -24.384,
+  "etf_netflow_usd": -2195000000,
+
+  "usdt_daily_mc": -4979500,
+  "usdt_sma30": -1090000000,
+  "usdt_60d_change": -3225900000,
+  "usdt_60d_sma30": -980000000,
+
+  "ntv_25h": 31270000,
+  "ntv_sell_count": 2,
+  "ntv_light_buy": 0,
+  "ntv_strong_buy": 0,
+  "ntv_light_sell": 1,
+  "ntv_strong_sell": 1,
+
+  "futuresPower": 50.0,
+  "futuresIndex": 0.45,
+  "futuresLine": 0.47,
+  "futures30dChange": -0.14,
+
+  "bb_overheated_bull": 0,
+  "bb_bull": 0,
+  "bb_bear": 1,
+  "bb_early_bull": 0,
+  "bb_extreme_bear": 0,
+  "bullBear365d": -0.242947,
+  "bullBear30d": -0.243843,
+
+  "soprAlert": 1,
+  "soprRatio": 0.965206,
+  "soprSma90": 0.982000,
+
+  "lthNupl": 0.013080,
+  "sthNupl": 0.037994,
+  "nuplAvg": 0.025537,
+  "nuplLine": 0.025537,
+
+  "utxoRatio": 0.002857,
+  "utxoSma365": 2.031,
+  "utxoFlag": 1,
+
+  "coh_10k_plus": -0.181,
+  "coh_1k_10k": -0.243,
+  "coh_100_1k": -0.243,
+  "coh_10_100": -0.176,
+  "coh_1_10": -0.097,
+  "coh_01_1": -0.097,
+  "coh_0_01": -0.097,
+
+  "sov_btc_0_1": 1.05,
+  "sov_btc_1_10": 0.98,
+  "sov_btc_10_100": 0.94,
+  "sov_btc_100_1k": 0.91,
+  "sov_btc_1k_10k": 0.88,
+  "sov_btc_10k_inf": 0.85,
+  "sov_btc_0_1_sma7": 1.04,
+  "sov_btc_1_10_sma7": 0.97,
+  "sov_btc_10_100_sma7": 0.93,
+  "sov_btc_100_1k_sma7": 0.90,
+  "sov_btc_1k_10k_sma7": 0.87,
+  "sov_btc_10k_inf_sma7": 0.84,
+  "sov_total_sma7": 0.926,
+  "sov_avg_price": 64512.30,
+  "sov_signal": 0,
+
+  "mvrv_7d": 1.215,
+  "mvrv_log_7d": 0.196,
+  "mvrv_zscore_365d": -1.241,
+  "mvrv_zscore_4yr": -1.154,
+  "mvrvPct": 0.2857,
+  "mvrv_zscore": -1.241,
+  "mvrv_high_signal": 0,
+  "mvrv_low_signal": 1,
+  "mvrv_zone": "Deep undervaluation — LT buy zone",
+
+  "mayerMultiple": 0.653313,
+  "mayer_oversold": 1,
+  "mayer_sma200": 97680.50,
+  "mayer_overbought": 0,
+  "mayer_hi_overbought": 0,
+  "mayerAlert": 1,
+
+  "sharpeShort": -0.404046,
+
+  "thermalScore": 4.17
+}
