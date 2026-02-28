@@ -1,0 +1,29 @@
+name: UTXO Diagnostic — BGeometrics Endpoint Finder
+
+# ── Déclenché MANUELLEMENT uniquement ──
+# Actions → UTXO Diagnostic → Run workflow
+# Consulter les logs pour voir les endpoints disponibles
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  diagnostic:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout du repo
+        uses: actions/checkout@v4
+
+      - name: Installer Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Installer les dépendances
+        run: pip install requests
+
+      - name: Lancer le diagnostic BGeometrics
+        run: python btc_utxo_diagnostic.py
