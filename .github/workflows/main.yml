@@ -1,0 +1,82 @@
+name: BTC 30min Update
+
+on:
+  schedule:
+    - cron: '*/30 * * * *'
+
+  push:
+    branches: [ main ]
+    paths:
+      - 'btc_pipeline.py'
+      - 'main.yml'
+      - 'requirements.txt'
+
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout du repo
+        uses: actions/checkout@v4
+        with:
+          # fetch-depth: 0 permet au rebase de voir tout l'historique
+          # évite le "shallow update not allowed" en cas de conflit
+          fetch-depth: 0
+
+      - name: Installer Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # ── Cache pip — clé dynamique sur le hash de requirements.txt ──────────
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Installer les dépendances
+        run: pip install -r requirements.txt
+
+      # ── Pipeline avec retry 3× ─────────────────────────────────────────────
+      - name: Lancer le pipeline BTC (retry 3x)
+        env:
+          RESEARCHBTC_TOKEN: ${{ secrets.RESEARCHBTC_TOKEN }}
+          BGEOMETRICS_TOKEN: ${{ secrets.BGEOMETRICS_TOKEN }}
+        run: |
+          MAX=3
+          DELAY=30
+          n=1
+          while [ $n -le $MAX ]; do
+            echo "── Tentative $n/$MAX ──────────────────────────"
+            python btc_pipeline.py && break
+            echo "Pipeline echoue tentative $n/$MAX"
+            if [ $n -lt $MAX ]; then
+              echo "  Attente ${DELAY}s avant retry..."
+              sleep $DELAY
+            fi
+            n=$((n+1))
+          done
+          if [ $n -gt $MAX ]; then
+            echo "Pipeline echoue apres $MAX tentatives"
+            exit 1
+          fi
+
+      - name: Commit et push btc_dashboard.json
+        run: |
+          git config --global user.name  "btc-bot"
+          git config --global user.email "btc-bot@github.com"
+          git add btc_dashboard.json
+          git add rbn_sopr_sma90_cache.json 2>/dev/null || true
+          git commit -m "data: $(date -u '+%Y-%m-%d %H:%M') UTC" || echo "No changes"
+          # ── Anti-reject non-fast-forward ───────────────────────────────────
+          # Rebase proprement si un autre run a pushé pendant l'exécution
+          git pull --rebase origin main
+          git push
