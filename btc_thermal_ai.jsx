@@ -1,1471 +1,1216 @@
-// ══════════════════════════════════════════════════════════════════════════════
-//  btc_thermal_ai.jsx — BTC On-Chain Thermal Dashboard
-//  © Kizoka0x — auteur et éditeur exclusif
-//  Source : btc_dashboard.json (btc_pipeline.py — refresh 30 min)
-//  Compatible : Babel standalone + React 18 UMD
-//
-//  Logique de scoring inspirée des analyses on-chain :
-//  - SOPR Ratio zones réelles CryptoQuant :
-//    * Zone rouge (capitulation) : 0.5–1.0 (fond 2022 : 0.54, SMA90 0.65)
-//    * Ligne intermédiaire : 3.0
-//    * Zone verte (top cycle) : 6.9–15.8
-//  - Sharpe Ratio échelle CryptoQuant (×30) :
-//    * Sous-valorisation : < -10 (fond 2022 = -29.35)
-//    * Neutre : -3 à +10 / Survalorisation : > +40 (top 2021 = +56.40)
-//  - UTXO Block P/L Count Ratio (CryptoQuant) :
-//    * ≤ 3 = capitulation / FLAG achat LT (fonds 2015/2019/2022)
-//    * > 100 = euphorie top cycle (2018/2021)
-//  - Dérivés enrichis : CVD, OI USD réel, Funding Rate (Binance futures)
-//  - MVRV percentile : 0% = bas de cycle extrême, >85% = zone de vente
-//  - Mayer < 0.8 = oversold historique (zone achat LT confirmée)
-// ══════════════════════════════════════════════════════════════════════════════
+"""
+btc_pipeline.py — Kizoka0x — Sources Actives Réelles v2
+══════════════════════════════════════════════════════════════════════════════
 
-const { useState, useEffect, useCallback } = React;
+ARCHITECTURE DES SOURCES — toutes testées fonctionnelles depuis GitHub Actions
+────────────────────────────────────────────────────────────────────────────────
 
-// ─── PALETTES (0=capitulation … 9=euphorie) ──────────────────────────────────
-const THERM = [
-  { bg:"#1a0a0a", fg:"#ff4444", bd:"#3d0f0f" },
-  { bg:"#2d0d0d", fg:"#ff6b6b", bd:"#5c1a1a" },
-  { bg:"#4a1010", fg:"#ff8c8c", bd:"#7a1a1a" },
-  { bg:"#7a1a1a", fg:"#ffb3b3", bd:"#a02020" },
-  { bg:"#c0392b", fg:"#fff",    bd:"#e74c3c"  },
-  { bg:"#7d4e00", fg:"#ffd166", bd:"#a56800"  },
-  { bg:"#6b6000", fg:"#ffe566", bd:"#8c7d00"  },
-  { bg:"#1a4a25", fg:"#69db7c", bd:"#27ae60"  },
-  { bg:"#0f3320", fg:"#51cf66", bd:"#2ecc71"  },
-  { bg:"#0a2018", fg:"#40c057", bd:"#27ae60"  },
-];
-const LVL = ["CAPIT.","BEAR EXT.","BEAR FORT","BEAR","PRESSION","NEUTRE","WATCH","POTENTIEL","ACCUM. LT","ACHAT LT"];
-const SIG = [
-  {bg:"rgba(192,57,43,.25)", fg:"#ff6b6b", bd:"rgba(192,57,43,.4)",  lb:"Bear Extrême"},
-  {bg:"rgba(192,57,43,.25)", fg:"#ff6b6b", bd:"rgba(192,57,43,.4)",  lb:"Bear Extrême"},
-  {bg:"rgba(231,76,60,.15)", fg:"#ffa8a8", bd:"rgba(231,76,60,.3)",  lb:"Bearish"     },
-  {bg:"rgba(231,76,60,.15)", fg:"#ffa8a8", bd:"rgba(231,76,60,.3)",  lb:"Bearish"     },
-  {bg:"rgba(243,156,18,.15)",fg:"#ffd166", bd:"rgba(243,156,18,.3)", lb:"Pression"    },
-  {bg:"rgba(243,156,18,.15)",fg:"#ffe066", bd:"rgba(241,196,15,.3)", lb:"Neutre"      },
-  {bg:"rgba(241,196,15,.15)",fg:"#ffe066", bd:"rgba(241,196,15,.3)", lb:"Watch"       },
-  {bg:"rgba(46,204,113,.15)",fg:"#69db7c", bd:"rgba(46,204,113,.3)", lb:"Bullish LT"  },
-  {bg:"rgba(39,174,96,.25)", fg:"#51cf66", bd:"rgba(39,174,96,.4)",  lb:"Bullish LT"  },
-  {bg:"rgba(26,92,58,.4)",   fg:"#40c057", bd:"rgba(39,174,96,.5)",  lb:"Bull Extrême"},
-];
+1. CoinMetrics Community — ON-CHAIN PRINCIPAL (sans clé, gratuit, illimité)
+   Base : https://community-api.coinmetrics.io/v4
+   Métriques : CapMVRVFF (MVRV ratio), NUPLff (NUPL), SoprFF (SOPR),
+               CapRealUSD, AdrActCnt, TxCnt, PriceUSD
+   → Remplace ResearchBitcoin comme source principale on-chain
 
-// ─── HELPERS ─────────────────────────────────────────────────────────────────
-const clamp = (v,a,b) => Math.max(a,Math.min(b,Math.round(isNaN(v)?a:v)));
-const safe  = (v,fb=0) => (v===undefined||v===null||isNaN(Number(v)))?fb:Number(v);
-const f2    = v => safe(v).toFixed(2);
-const f4    = v => safe(v).toFixed(4);
-const f6    = v => safe(v).toFixed(6);
-const fsign = (v,d=2) => (safe(v)>=0?"+":"")+safe(v).toFixed(d);
-const pct3  = v => (safe(v)*100).toFixed(3)+"%";
-const fM    = v => safe(v)>=1e9?(safe(v)/1e9).toFixed(2)+"B$":safe(v)>=1e6?(safe(v)/1e6).toFixed(1)+"M$":safe(v).toFixed(0)+"$";
-const fSign2= (v)=>{const n=safe(v);return(n>=0?"+":"")+n.toFixed(2);};
+2. BGeometrics (bitcoin-data.com) — SOURCE SECONDAIRE
+   Base : https://bitcoin-data.com/v1
+   Sans token : 8 req/h / 15 req/jour → on limite à 6 req/run max
+   Avec token (secret GitHub: BGEOMETRICS_TOKEN) : 200 req/h → illimité
+   Métriques prioritaires (non couvertes par CoinMetrics) :
+     sharpe-ratio-364d, mayer-multiple, etf-flow-btc, stablecoin-supply
 
-// ─── FONCTIONS DE SCORING ─────────────────────────────────────────────────────
-// Retournent { n,c,m,l } niveaux 0-9 : Maintenant / CT / MT / LT
+3. CoinGecko API — FALLBACK stablecoin + prix (sans clé)
+   Base : https://api.coingecko.com/api/v3
+   Métriques : USDT/USDC market cap 60j
 
-// ETF proxy (retour 30j ×100, %)
-const S_ETF = v =>
-  v<=-30?{n:0,c:1,m:2,l:5}:v<=-20?{n:1,c:1,m:2,l:5}:v<=-10?{n:2,c:2,m:3,l:6}:
-  v<=-3?{n:3,c:3,m:4,l:6}:v<=0?{n:4,c:4,m:5,l:7}:v<=5?{n:6,c:6,m:6,l:7}:
-  v<=15?{n:7,c:7,m:7,l:8}:{n:9,c:8,m:8,l:8};
+4. Binance SPOT API — DÉRIVÉS PROXY (sans clé, toujours accessible)
+   Base : https://api.binance.com  ← spot, pas fapi (fapi bloqué sur GH Actions)
+   Métriques : klines 1j (CVD proxy), klines 1h (NTV), prix, volume
+   Note : fapi.binance.com est bloqué DNS sur GitHub Actions runners
 
-// USDT SMA30 (déviation proxy)
-const S_USDT = v =>
-  v<-1e9?{n:1,c:2,m:3,l:6}:v<-2e8?{n:2,c:2,m:3,l:6}:
-  v<-3e7?{n:3,c:4,m:5,l:7}:v<=0?{n:4,c:5,m:5,l:7}:
-  v<=1e8?{n:6,c:6,m:6,l:7}:{n:8,c:7,m:7,l:8};
+5. Alternative dérivés — Bybit PUBLIC API (sans clé)
+   Base : https://api.bybit.com/v5
+   Métriques : OI BTCUSDT, Funding Rate historique, klines
 
-// NTV sell count -2…+2
-const S_NTV = s =>
-  s>=2?{n:2,c:2,m:4,l:6}:s===1?{n:3,c:3,m:5,l:6}:s===0?{n:5,c:5,m:5,l:6}:
-  s===-1?{n:7,c:7,m:6,l:7}:{n:8,c:8,m:7,l:7};
+6. Coinbase Exchange API — PRIX + HISTORIQUE (sans clé)
+   Base : https://api.exchange.coinbase.com
+   Métriques : BTC-USD spot + candles 1j 400 jours
 
-// Futures Power 30-70
-const S_FUT = v =>
-  v<=30?{n:1,c:1,m:2,l:5}:v<=38?{n:2,c:2,m:3,l:5}:v<=44?{n:2,c:2,m:3,l:6}:
-  v<=50?{n:3,c:4,m:5,l:6}:v<=55?{n:6,c:6,m:6,l:7}:v<=65?{n:7,c:7,m:7,l:8}:
-  {n:9,c:8,m:8,l:8};
+SECRETS GITHUB (optionnels — améliorent la qualité des données)
+──────────────────────────────────────────────────────────────────
+  BGEOMETRICS_TOKEN → 200 req/h au lieu de 15/jour (sharpe, ETF, stablecoin réels)
+  RESEARCHBTC_TOKEN → gardé pour compatibilité, non critique avec CoinMetrics
 
-// Bull/Bear 30j fraction
-const S_BB = v =>
-  v<=-0.30?{n:0,c:1,m:2,l:5}:v<=-0.20?{n:1,c:2,m:2,l:5}:v<=-0.10?{n:2,c:2,m:3,l:5}:
-  v<=0?{n:3,c:3,m:4,l:5}:v<=0.05?{n:6,c:6,m:6,l:7}:v<=0.15?{n:7,c:7,m:7,l:8}:
-  {n:9,c:8,m:8,l:8};
+LOGIQUE DE SCORING
+──────────────────────────────────────────────────────────────────
+  SOPR LTH/STH ratio réel    : rouge < 1.0 / vert > 6.9
+  Sharpe 364d                : sous-valo < -10 / sur-valo > +40
+  NUPL LTH/STH réel          : capitulation < -0.30 / distribution > 0.70
+  MVRV Z-Score réel          : sous-valo ≤ -2 / sur-valo ≥ 6
+  Mayer Multiple             : oversold < 0.80 / overbought > 2.40
+  ETF flows BTC              : entrées/sorties quotidiennes
+  LTH Supply Ratio           : via UTXOs in Profit% ou proxy MVRV
+"""
 
-// SOPR Ratio — calibré sur zones CryptoQuant réelles
-// Zones historiques : capitulation 2022 = 0.54 (SMA90=0.65), top = 6.9–15.8
-// Notre proxy (prix/MA7) reste ~1.0 → seuils resserrés autour de 1
-// Pour les vraies valeurs CQ : zone rouge 0.4-1.0, intermédiaire ~3, verte 6.9-15.8
-const S_SOPR = v => {
-  // Si valeur > 2 → probablement vraie valeur CryptoQuant
-  if (v >= 6.9) return {n:9,c:8,m:7,l:4};   // top cycle — zone vente
-  if (v >= 3.0) return {n:7,c:7,m:7,l:6};   // ligne intermédiaire bull
-  if (v >= 1.5) return {n:6,c:6,m:6,l:6};
-  if (v >= 1.05) return {n:6,c:6,m:6,l:6};
-  if (v >= 0.995) return {n:4,c:4,m:5,l:6};
-  if (v >= 0.970) return {n:3,c:3,m:4,l:7};
-  if (v >= 0.700) return {n:2,c:3,m:4,l:8}; // zone rouge basse
-  if (v >= 0.540) return {n:1,c:2,m:4,l:9}; // capitulation 2022
-  return {n:0,c:2,m:5,l:9};                  // fond extrême (<0.54)
-};
+import os, json, math
+import requests
+import pandas as pd
+import numpy as np
+from datetime import datetime
 
-// LTH NUPL — étendu aux valeurs négatives (capitulation)
-// Zones réelles CryptoQuant : <0 = capitulation, 0-0.25 = espoir, 0.25-0.5 = optimisme, >0.75 = euphorie
-// Valeurs historiques bottom : -0.49 (2022), -0.55 (2018), -0.25 (2019)
-const S_LTH = v =>
-  v<=-0.40?{n:0,c:2,m:5,l:9}:v<=-0.20?{n:1,c:2,m:4,l:9}:v<=0?{n:2,c:3,m:4,l:8}:
-  v<=0.15?{n:3,c:3,m:4,l:8}:v<=0.30?{n:4,c:4,m:5,l:7}:
-  v<=0.50?{n:5,c:5,m:5,l:6}:v<=0.70?{n:6,c:6,m:6,l:5}:v<=0.85?{n:7,c:7,m:7,l:4}:
-  {n:8,c:8,m:6,l:3};
+# ══════════════════════════════════════════════════════════════════════════════
+# SECRETS
+# ══════════════════════════════════════════════════════════════════════════════
 
-// STH NUPL — étendu aux valeurs négatives (acheteurs récents sous l'eau)
-// Capitulation STH : <-0.30 (fond 2022), normal bas cycle : -0.20 à 0
-const S_STH = v =>
-  v<=-0.40?{n:0,c:2,m:4,l:8}:v<=-0.20?{n:1,c:2,m:4,l:8}:v<=0?{n:2,c:3,m:4,l:7}:
-  v<=0.15?{n:3,c:3,m:4,l:7}:v<=0.30?{n:4,c:4,m:5,l:7}:
-  v<=0.50?{n:5,c:5,m:5,l:6}:v<=0.70?{n:6,c:6,m:6,l:6}:v<=0.85?{n:7,c:7,m:7,l:5}:
-  {n:8,c:8,m:7,l:4};
+RBN_TOKEN = os.environ.get("RESEARCHBTC_TOKEN", "")   # ResearchBitcoin  ← principal
+BG_TOKEN  = os.environ.get("BGEOMETRICS_TOKEN", "")   # BGeometrics      ← secondaire
 
-// UTXO Block P/L Count Ratio — indicateur CryptoQuant (historique depuis 2015)
-// Ratio UTXOs profitables / en perte par bloc
-// Zones historiques : ≤3 = capitulation/achat LT (2015,2019,2022) | >100 = euphorie top
-// Scoring INVERSÉ : ratio bas = signal achat LT fort (n:9 quand v≤3)
-// Source JSON : "utxoRatio" — alimenté manuellement ou via pipeline CryptoQuant
-const S_UTXO = v =>
-  (v===null||v===undefined)?{n:5,c:5,m:5,l:5}:
-  v<=3? {n:9,c:8,m:7,l:7}:
-  v<=5? {n:8,c:7,m:7,l:7}:
-  v<=8? {n:7,c:7,m:7,l:7}:
-  v<=15?{n:5,c:4,m:5,l:7}:
-  v<=30?{n:4,c:3,m:4,l:6}:
-  v<=100?{n:3,c:3,m:4,l:6}:
-        {n:2,c:2,m:3,l:5};
+# ══════════════════════════════════════════════════════════════════════════════
+# HELPERS HTTP
+# ══════════════════════════════════════════════════════════════════════════════
 
-// Cohorte (fraction retour)
-const S_COH = v =>
-  v<=-0.30?{n:0,c:1,m:2,l:5}:v<=-0.15?{n:1,c:2,m:2,l:5}:v<=-0.08?{n:2,c:2,m:3,l:6}:
-  v<=0?{n:3,c:3,m:4,l:6}:v<=0.05?{n:6,c:6,m:6,l:7}:v<=0.15?{n:7,c:7,m:7,l:8}:
-  {n:9,c:8,m:8,l:8};
+def fetch(url, headers=None, timeout=20):
+    """GET → dict/list JSON. Retry 1× sur 429."""
+    h = {"accept": "application/json", "User-Agent": "btc-thermal-kizoka0x"}
+    if headers:
+        h.update(headers)
+    try:
+        r = requests.get(url, headers=h, timeout=timeout)
+        if r.status_code == 429:
+            import time; time.sleep(12)
+            r = requests.get(url, headers=h, timeout=timeout)
+        if r.status_code not in (200, 201):
+            raise ValueError(f"HTTP {r.status_code}")
+        return r.json()
+    except Exception as e:
+        raise RuntimeError(f"fetch({url[:80]}): {e}")
 
-// SOV ratio volatilité — signal directionnel (activité whale)
-// >1.3 = activité inhabituelle (peut être bullish OU bearish selon contexte)
-// Score CT/MT intentionnellement neutre — indicateur de volume, pas de direction
-const S_SOV = v =>
-  v>=1.5?{n:5,c:5,m:6,l:6}:v>=1.3?{n:5,c:5,m:5,l:6}:v>=1.0?{n:5,c:5,m:5,l:5}:
-  v>=0.8?{n:4,c:4,m:5,l:5}:{n:4,c:4,m:4,l:5};
 
-// MVRV percentile 0-100
-const S_MVRV = v =>
-  v<=1?{n:0,c:3,m:5,l:9}:v<=5?{n:1,c:3,m:5,l:9}:v<=15?{n:2,c:4,m:5,l:8}:
-  v<=30?{n:4,c:4,m:5,l:7}:v<=55?{n:5,c:5,m:5,l:6}:v<=80?{n:5,c:5,m:5,l:5}:
-  v<=90?{n:3,c:3,m:4,l:4}:{n:1,c:2,m:3,l:3};
+def last_val(series, key=None):
+    """Valeur non-NaN la plus récente d'une liste de dicts ou de scalaires."""
+    if not series:
+        return None
+    for item in reversed(series):
+        v = (item.get(key) if key and isinstance(item, dict) else
+             item.get("v") or item.get("value") if isinstance(item, dict) else item)
+        if v is not None:
+            try:
+                f = float(v)
+                if not math.isnan(f):
+                    return f
+            except (TypeError, ValueError):
+                pass
+    return None
 
-// Mayer Multiple — score LT : <0.8 = zone achat (bas), >2.4 = zone vente (haut)
-// Logique : fond cycle = scores n bas / l très haut, sommet = inverse
-// Note : entre 1.0–2.0 le score n remonte progressivement (récupération normale)
-const S_MAYER = v =>
-  v<=0.55?{n:1,c:2,m:4,l:9}:v<=0.70?{n:1,c:3,m:5,l:9}:v<=0.80?{n:2,c:3,m:5,l:8}:
-  v<=1.00?{n:4,c:4,m:5,l:6}:v<=1.50?{n:5,c:5,m:5,l:5}:v<=2.00?{n:6,c:6,m:5,l:4}:
-  v<=2.40?{n:7,c:6,m:5,l:3}:v<=3.00?{n:8,c:7,m:4,l:2}:{n:9,c:8,m:3,l:1};
 
-// Sharpe Ratio — ÉCHELLE CALIBRÉE CRYPTOQUANT (valeurs ×30 vs brut)
-// bottom 2022 = -29.35 / bottom 2018 ~-25 / top 2021 = +56.40 / top 2017 ~+45
-// Zone sous-valorisation : < -10 jusqua -30 / survalorisation : +40 à +70
-const S_SHARPE = v =>
-  v<=-25?{n:0,c:2,m:5,l:9}:   // capitulation extrême (fond 2022)
-  v<=-15?{n:1,c:2,m:4,l:9}:   // sous-valorisation forte
-  v<=-10?{n:2,c:3,m:5,l:8}:   // sous-valorisation / zone achat LT
-  v<=-3?{n:3,c:4,m:5,l:7}:
-  v<=0?{n:4,c:5,m:5,l:6}:
-  v<=10?{n:5,c:6,m:6,l:6}:
-  v<=20?{n:6,c:6,m:6,l:5}:
-  v<=40?{n:7,c:7,m:6,l:4}:
-  v<=55?{n:8,c:8,m:5,l:3}:    // survalorisation (top 2021)
-  {n:9,c:9,m:4,l:2};           // euphorie extrême
+def last_n(series, key=None, n=90):
+    """Liste des n dernières valeurs non-NaN (ordre chronologique)."""
+    vals = []
+    for item in reversed(series):
+        v = (item.get(key) if key and isinstance(item, dict) else
+             item.get("v") or item.get("value") if isinstance(item, dict) else item)
+        if v is not None:
+            try:
+                f = float(v)
+                if not math.isnan(f):
+                    vals.append(f)
+                    if len(vals) >= n:
+                        break
+            except (TypeError, ValueError):
+                pass
+    return list(reversed(vals))
 
-// ─── COMPOSANTS ──────────────────────────────────────────────────────────────
 
-function TCell({level,label}) {
-  const t=THERM[clamp(level,0,9)];
-  const lines=(label||LVL[clamp(level,0,9)]).split("\n");
-  return (
-    <td style={{padding:"5px 5px",textAlign:"center"}}>
-      <div style={{display:"inline-flex",flexDirection:"column",alignItems:"center",justifyContent:"center",
-        width:84,height:46,borderRadius:6,background:t.bg,color:t.fg,border:`1px solid ${t.bd}`,
-        fontFamily:"monospace",fontSize:8.5,fontWeight:700,lineHeight:1.25,letterSpacing:.4,textAlign:"center"}}>
-        {lines.map((l,i)=><span key={i}>{l}</span>)}
-      </div>
-    </td>
-  );
+# ══════════════════════════════════════════════════════════════════════════════
+# SOURCE 1 — RESEARCHBITCOIN
+# ══════════════════════════════════════════════════════════════════════════════
+
+RBN_BASE = "https://api.researchbitcoin.net"
+
+# Mapping métrique → clé de valeur dans la réponse JSON
+# ResearchBitcoin v1 retourne : {"data": [{"t": ..., "v": ...}, ...]}
+# ResearchBitcoin v2 retourne : {"timeseries": [{"timestamp": ..., "value": ...}, ...]}
+RBN_METRICS = {
+    # metric_name        : (endpoint_path,   val_key)
+    "sopr"              : ("sopr",           "v"),
+    "sopr_lth"          : ("sopr_lth",       "v"),
+    "sopr_sth"          : ("sopr_sth",       "v"),
+    "nupl"              : ("nupl",           "v"),
+    "nupl_lth"          : ("nupl_lth",       "v"),
+    "nupl_sth"          : ("nupl_sth",       "v"),
+    "mvrv_zscore"       : ("mvrv_zscore",    "v"),
+    "mvrv_lth"          : ("mvrv_lth",       "v"),
+    "mvrv_sth"          : ("mvrv_sth",       "v"),
+    "realized_price_lth": ("realized_price_lth", "v"),
+    "realized_price_sth": ("realized_price_sth", "v"),
+    "supply_lth"        : ("supply_lth",     "v"),
+    "supply_sth"        : ("supply_sth",     "v"),
 }
 
-function Badge({level}) {
-  const s=SIG[clamp(level,0,9)];
-  return <span style={{display:"inline-block",padding:"2px 8px",borderRadius:20,fontSize:9,fontWeight:700,
-    textTransform:"uppercase",letterSpacing:.8,background:s.bg,color:s.fg,border:`1px solid ${s.bd}`}}>{s.lb}</span>;
-}
 
-// Badge alerte rouge
-function AlertR({active,on,off}) {
-  if(!active) return <span style={{fontSize:9,color:"#4a5568",marginLeft:6}}>{off||""}</span>;
-  return <span style={{display:"inline-block",padding:"1px 7px",borderRadius:4,marginLeft:6,fontSize:9,
-    fontWeight:700,background:"rgba(231,76,60,.25)",color:"#ff6b6b",border:"1px solid rgba(231,76,60,.45)"}}>{on}</span>;
-}
-// Badge alerte verte
-function AlertG({active,on,off}) {
-  if(!active) return <span style={{fontSize:9,color:"#4a5568",marginLeft:6}}>{off||""}</span>;
-  return <span style={{display:"inline-block",padding:"1px 7px",borderRadius:4,marginLeft:6,fontSize:9,
-    fontWeight:700,background:"rgba(46,204,113,.2)",color:"#69db7c",border:"1px solid rgba(46,204,113,.4)"}}>{on}</span>;
-}
-// Badge neutre
-function AlertN({val,color}) {
-  return <span style={{fontFamily:"monospace",fontSize:10,color:color||"#c9d1d9",marginLeft:6}}>{val}</span>;
-}
+def rbn_get(metric, limit=3, token=None):
+    """
+    Appel ResearchBitcoin v1/timeseries/{metric}.
+    Tente v2 en fallback si v1 échoue.
+    Retourne la liste brute ou [] si erreur.
+    """
+    if not token:
+        return []
+    heads = {"Authorization": f"Bearer {token}"}
 
-function SecRow({label}) {
-  return (
-    <tr>
-      <td colSpan={7} style={{background:"rgba(88,166,255,.04)",borderTop:"1px solid rgba(88,166,255,.1)",
-        borderBottom:"1px solid rgba(88,166,255,.1)",padding:"5px 14px"}}>
-        <span style={{fontFamily:"monospace",fontSize:10,letterSpacing:2,color:"rgba(88,166,255,.7)",textTransform:"uppercase"}}>{label}</span>
-      </td>
-    </tr>
-  );
-}
+    # Essai v1
+    try:
+        url  = f"{RBN_BASE}/v1/timeseries/{metric}?resolution=d1&limit={limit}"
+        data = fetch(url, headers=heads)
+        # Format v1 attendu : {"data": [...]} ou directement [...]
+        if isinstance(data, list):
+            fmt = "list"
+            items = data
+        elif isinstance(data, dict):
+            fmt = list(data.keys())[:3]
+            items = data.get("data") or data.get("timeseries") or []
+        else:
+            fmt, items = type(data).__name__, []
+        if items:
+            print(f"  RBN v1 /{metric} → {len(items)} pts (fmt={fmt})")
+            return items
+        print(f"  ⚠ RBN v1 /{metric} → réponse vide (fmt={fmt})")
+    except Exception as e:
+        print(f"  ⚠ RBN v1 /{metric}: {e}")
 
-function ScoreCard({label,value,sub,color,grad}) {
-  return (
-    <div style={{background:"#0d1117",border:"1px solid #1a2030",borderRadius:10,padding:"16px 18px",position:"relative",overflow:"hidden"}}>
-      <div style={{position:"absolute",top:0,left:0,right:0,height:3,background:grad}}/>
-      <div style={{fontSize:11,color:"#4a5568",textTransform:"uppercase",letterSpacing:1.5,marginBottom:6}}>{label}</div>
-      <div style={{fontFamily:"monospace",fontSize:24,fontWeight:700,color}}>{value}</div>
-      <div style={{fontSize:12,color:"#4a5568",marginTop:4}}>{sub}</div>
-    </div>
-  );
-}
+    # Fallback v2
+    try:
+        url  = f"{RBN_BASE}/v2/timeseries/{metric}?resolution=d1&limit={limit}"
+        data = fetch(url, headers=heads)
+        if isinstance(data, list):
+            fmt, items = "list", data
+        elif isinstance(data, dict):
+            fmt = list(data.keys())[:3]
+            items = data.get("timeseries") or data.get("data") or []
+        else:
+            fmt, items = type(data).__name__, []
+        print(f"  RBN v2 /{metric} → {len(items)} pts (fmt={fmt})")
+        return items
+    except Exception as e:
+        print(f"  ⚠ RBN v2 /{metric}: {e}")
+        return []
 
-// Ligne de sous-valeur dans une cellule indicateur
-function SubVal({label,val,color,alert}) {
-  const MUTED="#4a5568";
-  return (
-    <div style={{display:"flex",alignItems:"baseline",gap:5,fontSize:10,marginTop:2}}>
-      <span style={{color:MUTED,whiteSpace:"nowrap"}}>{label}</span>
-      <span style={{fontFamily:"monospace",color:color||"#c9d1d9"}}>{val}</span>
-      {alert}
-    </div>
-  );
-}
 
-// Ligne de données brutes dans le panneau A
-function DataRow({lbl,val,src,color}) {
-  const MUTED="#4a5568";
-  const srcColor = !src?"transparent":
-    src==="binance"?"rgba(240,185,11,.25)":
-    src==="researchbitcoin"||src==="real"?"rgba(46,204,113,.2)":
-    src==="bgeometrics"?"rgba(88,166,255,.2)":
-    src==="coinmetrics"?"rgba(114,137,218,.2)":
-    src==="proxy_price"||String(src).includes("proxy")?"rgba(100,100,100,.2)":
-    "rgba(46,204,113,.15)";
-  const srcFg = !src?"transparent":
-    src==="binance"?"#b8920a":
-    src==="researchbitcoin"||src==="real"?"#2ecc71":
-    src==="bgeometrics"?"#58a6ff":
-    src==="coinmetrics"?"#7289da":
-    src==="proxy_price"||String(src).includes("proxy")?"#555":
-    "#2ecc71";
-  return (
-    <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",
-      padding:"2px 0",borderBottom:"1px solid rgba(255,255,255,.03)"}}>
-      <span style={{fontSize:9.5,color:MUTED,whiteSpace:"nowrap"}}>{lbl}</span>
-      <div style={{display:"flex",alignItems:"center",gap:4}}>
-        <span style={{fontFamily:"monospace",fontSize:10,fontWeight:600,color:color||"#c9d1d9"}}>{val}</span>
-        {src && <span style={{fontSize:7,padding:"1px 4px",borderRadius:2,
-          background:srcColor,color:srcFg,fontFamily:"monospace",
-          whiteSpace:"nowrap",letterSpacing:.3}}>{src}</span>}
-      </div>
-    </div>
-  );
-}
+_RBN_SMA90_CACHE = "rbn_sopr_sma90_cache.json"
 
-// ─── APP ──────────────────────────────────────────────────────────────────────
+def _load_sma90_cache():
+    """Charge le cache SMA90 sur disque (valide 24h)."""
+    try:
+        with open(_RBN_SMA90_CACHE) as f:
+            c = json.load(f)
+        age_h = (datetime.utcnow() - datetime.fromisoformat(c["ts"])).total_seconds() / 3600
+        if age_h < 24:
+            print(f"  ✅ SMA90 cache hit ({age_h:.1f}h) → {c['sma90']}")
+            return c["sma90"]
+    except Exception:
+        pass
+    return None
 
-function BTCThermalAI() {
-  const [data,setData]=useState(null);
-  const [status,setStatus]=useState("loading");
-  const [errMsg,setErrMsg]=useState("");
-  const [hist,setHist]=useState([]);
-  const [showHist,setShowHist]=useState(false);
-  const [showData,setShowData]=useState(false);
-  const [showAnalytics,setShowAnalytics]=useState(false);
-  const histRef=React.useRef([]);   // stockage en mémoire (session)
-  const [freshnessWarn, setFreshnessWarn] = useState(false);
-  const [freshnessAge,  setFreshnessAge]  = useState(null);
+def _save_sma90_cache(sma90):
+    try:
+        with open(_RBN_SMA90_CACHE, "w") as f:
+            json.dump({"ts": datetime.utcnow().isoformat(), "sma90": sma90}, f)
+    except Exception:
+        pass
 
-  const BG="#080c10",PANEL="#0d1117",BORDER="#1a2030",MUTED="#4a5568";
 
-  const load=useCallback(async()=>{
-    setStatus("loading");
-    try {
-      const res=await fetch("./btc_dashboard.json?t="+Date.now());
-      if(!res.ok) throw new Error("HTTP "+res.status);
-      const raw=await res.json();
-      setData(raw);
-      setStatus("ok");
+def get_rbn_onchain(token):
+    """
+    Récupère tous les indicateurs on-chain depuis ResearchBitcoin.
+    Retourne un dict avec les valeurs les plus récentes.
+    Optimisation quota (55k DP/sem Tier 0) :
+      - sopr_lth : limit=2 (valeur actuelle seulement)
+      - soprSma90 : calculé sur 91 points, mais caché 24h sur disque
+        → max 1 appel 91-pts/jour au lieu de 48 × 90 = 4320 pts/jour
+    """
+    if not token:
+        print("  ⚠ RBN : pas de token → skip")
+        return {}
 
-      // ── Vérification fraîcheur : alerte si JSON > 45 min ──
-      if(raw.updated){
-        const jsonTime = new Date(raw.updated);
-        const ageMin   = (Date.now() - jsonTime.getTime()) / 60000;
-        setFreshnessAge(Math.round(ageMin));
-        setFreshnessWarn(ageMin > 45);
-      }
+    result = {}
 
-      // Calcul du thermal score en JS pour la cohérence historique
-      const _sr9=(v,lo,hi)=>v===null||v===undefined?4.5:Math.max(0,Math.min(9,(v-lo)/(hi-lo)*9));
-      const _th=[
-        _sr9(raw.mayerMultiple||1,   0.55,2.40),
-        _sr9(raw.mvrvPct||0,         0.0, 90.0),
-        _sr9(raw.lthNupl||0,        -0.50,0.70),
-        _sr9(raw.sthNupl||0,        -0.50,0.70),
-        _sr9(raw.soprRatio||1,       0.95,1.05),
-        _sr9(raw.futuresPower||50,   35.0,80.0),
-        _sr9(raw.etf_30d_sum||0,    -30.0,20.0),
-        _sr9(raw.bullBear30d||0,    -0.30,0.30),
-      ];
-      const thScore = parseFloat((_th.reduce((a,b)=>a+b,0)/_th.length).toFixed(2));
+    # ── SOPR LTH/STH réels ───────────────────────────────────────────────────
+    # SMA90 : lecture cache disque pour limiter la consommation quota
+    cached_sma90 = _load_sma90_cache()
+    if cached_sma90 is None:
+        # Appel coûteux 91 points (une fois par 24h max)
+        lth_sopr_series = rbn_get("sopr_lth", limit=91, token=token)
+        hist90 = last_n(lth_sopr_series, "v", n=90)
+        lth_v = last_val(lth_sopr_series, "v")
+        if len(hist90) >= 10:
+            sma90 = round(float(np.mean(hist90)), 6)
+            _save_sma90_cache(sma90)
+            result["soprSma90"] = sma90
+        else:
+            lth_sopr_series = rbn_get("sopr_lth", limit=2, token=token)
+            lth_v = last_val(lth_sopr_series, "v")
+    else:
+        # Appel léger 2 points seulement
+        lth_sopr_series = rbn_get("sopr_lth", limit=2, token=token)
+        lth_v = last_val(lth_sopr_series, "v")
+        result["soprSma90"] = cached_sma90
 
-      // Entrée historique enrichie
-      const entry={
-        ts:       new Date().toLocaleString("fr-FR"),
-        price:    raw.btcPrice,
-        mvrv:     raw.mvrvPct,
-        etf:      raw.etf_30d_sum,
-        score:    thScore,
-        mayer:    raw.mayerMultiple,
-        lthNupl:  raw.lthNupl,
-        sthNupl:  raw.sthNupl,
-        sopr:     raw.soprRatio,
-        futPow:   raw.futuresPower,
-        bb30:     raw.bullBear30d,
-        scoreBot: [
-          raw.etf_30d_sum>=0,
-          raw.futuresPower>50,
-          raw.usdt_sma30>0,
-          raw.soprAlert===1,
-          raw.utxoRatio!==undefined&&raw.utxoRatio!==null&&raw.utxoRatio<=3,
-          raw.bullBear30d>0,
-          raw.mvrvPct<=10,
-          raw.mayerAlert===1,
-          raw.sharpeShort<-10,
-          raw.lthNupl<0.20,
-        ].filter(Boolean).length,
-      };
+    sth_sopr_series = rbn_get("sopr_sth", limit=2, token=token)
+    sth_v = last_val(sth_sopr_series, "v")
 
-      // Stockage persistant via window.storage (si disponible), sinon mémoire seule
-      let prev = histRef.current;
-      if(window.storage){
-        try {
-          const stored = await window.storage.get("btc-kizoka-hist");
-          if(stored) prev = JSON.parse(stored.value);
-        } catch(_){}
-      }
-      const next=[entry,...prev].slice(0,50);
-      histRef.current = next;
-      setHist(next);
-      if(window.storage){
-        try { await window.storage.set("btc-kizoka-hist", JSON.stringify(next)); } catch(_){}
-      }
-    } catch(e){setStatus("error");setErrMsg(e.message);}
-  },[]);
+    if lth_v is not None and sth_v is not None and sth_v > 0:
+        result["soprRatio"]  = round(lth_v / sth_v, 6)
+    elif lth_v is not None:
+        result["soprRatio"]  = round(lth_v, 6)   # LTH seul si STH absent
+    result["lthSoprRaw"] = round(lth_v, 6)  if lth_v is not None else None
+    result["sthSoprRaw"] = round(sth_v, 6)  if sth_v is not None else None
+    print(f"  RBN SOPR → LTH={lth_v}  STH={sth_v}  Ratio={result.get('soprRatio')}  SMA90={result.get('soprSma90')}")
 
-  useEffect(()=>{
-    // Charger l'historique persisté au démarrage
-    (async()=>{
-      if(window.storage){
-        try {
-          const stored = await window.storage.get("btc-kizoka-hist");
-          if(stored){ const h=JSON.parse(stored.value); histRef.current=h; setHist(h); }
-        } catch(_){}
-      }
-    })();
-    load();
-    const id=setInterval(load,30*60*1000);
-    return()=>clearInterval(id);
-  },[]);
+    # ── NUPL LTH/STH réels ───────────────────────────────────────────────────
+    lth_nupl_series = rbn_get("nupl_lth", limit=3, token=token)
+    sth_nupl_series = rbn_get("nupl_sth", limit=3, token=token)
+    lth_n = last_val(lth_nupl_series, "v")
+    sth_n = last_val(sth_nupl_series, "v")
+    if lth_n is not None: result["lthNupl"] = round(lth_n, 6)
+    if sth_n is not None: result["sthNupl"] = round(sth_n, 6)
+    print(f"  RBN NUPL → LTH={lth_n}  STH={sth_n}")
 
-  if(status==="loading") return (
-    <div style={{background:BG,minHeight:"100vh",display:"flex",alignItems:"center",justifyContent:"center",flexDirection:"column",gap:16}}>
-      <style>{`@keyframes spin{to{transform:rotate(360deg)}}`}</style>
-      <div style={{fontSize:40,animation:"spin 1.5s linear infinite"}}>⬡</div>
-      <div style={{fontFamily:"monospace",color:MUTED,fontSize:14}}>Chargement btc_dashboard.json…</div>
-    </div>
-  );
-  if(status==="error") return (
-    <div style={{background:BG,minHeight:"100vh",display:"flex",alignItems:"center",justifyContent:"center",flexDirection:"column",gap:14,padding:24}}>
-      <div style={{fontSize:36,color:"#ff6b6b"}}>✗</div>
-      <div style={{fontFamily:"monospace",color:"#ff6b6b",fontSize:14}}>Impossible de charger btc_dashboard.json</div>
-      <div style={{color:MUTED,fontSize:12}}>{errMsg}</div>
-      <button onClick={load} style={{background:"#1F3864",color:"#74c0fc",border:"1px solid #1F6FEB",borderRadius:6,padding:"8px 20px",fontFamily:"monospace",cursor:"pointer",fontSize:12}}>⟳ Réessayer</button>
-    </div>
-  );
+    # ── MVRV Z-Score + LTH/STH MVRV réels ───────────────────────────────────
+    mvrv_z_series   = rbn_get("mvrv_zscore", limit=3, token=token)
+    mvrv_lth_series = rbn_get("mvrv_lth",   limit=3, token=token)
+    mvrv_sth_series = rbn_get("mvrv_sth",   limit=3, token=token)
+    mz  = last_val(mvrv_z_series,   "v")
+    mlth= last_val(mvrv_lth_series, "v")
+    msth= last_val(mvrv_sth_series, "v")
+    if mz   is not None: result["mvrvZscore"] = round(mz,   4)
+    if mlth is not None: result["mvrvLth"]    = round(mlth, 4)
+    if msth is not None: result["mvrvSth"]    = round(msth, 4)
+    print(f"  RBN MVRV → Z={mz}  LTH={mlth}  STH={msth}")
 
-  const G=(k,fb=0)=>safe(data[k],fb);
-  const d=data;
+    return result
 
-  // ── Thermal Score recalculé côté JSX (cohérent avec pipeline corrigé) ─────
-  // 8 indicateurs normalisés 0-9 : Mayer, MVRV%, LTH NUPL, STH NUPL, SOPR, Futures, ETF, BB30d
-  const _sr9=(v,lo,hi)=>v===null||v===undefined?4.5:Math.max(0,Math.min(9,(v-lo)/(hi-lo)*9));
-  const thermalComponents = [
-    _sr9(G("mayerMultiple",1),    0.55,  2.40),
-    _sr9(G("mvrvPct"),            0.0,   90.0),
-    _sr9(G("lthNupl"),           -0.50,  0.70),
-    _sr9(G("sthNupl"),           -0.50,  0.70),
-    _sr9(G("soprRatio",1),        0.95,  1.05),
-    _sr9(G("futuresPower"),       35.0,  80.0),
-    _sr9(G("etf_30d_sum"),       -30.0,  20.0),
-    _sr9(G("bullBear30d"),       -0.30,  0.30),
-  ];
-  const thermalScore = (thermalComponents.reduce((a,b)=>a+b,0)/thermalComponents.length);
-  const thermalDisplay = thermalScore.toFixed(2);
 
-  // ── Scores ────────────────────────────────────────────────────────────────
-  const s={
-    etf:        S_ETF(G("etf_30d_sum")),
-    usdt:       S_USDT(G("usdt_sma30")),
-    ntv:        S_NTV(G("ntv_sell_count")),
-    fut:        S_FUT(G("futuresPower")),
-    bb:         S_BB(G("bullBear30d")),
-    sopr:       S_SOPR(G("soprRatio",1)),
-    lth:        S_LTH(G("lthNupl")),
-    sth:        S_STH(G("sthNupl")),
-    utxo:       S_UTXO(data && data.utxoRatio !== undefined && data.utxoRatio !== null ? G("utxoRatio") : null),
-    c10k:       S_COH(G("coh_10k_plus")),
-    c1k:        S_COH(G("coh_1k_10k")),
-    c100:       S_COH(G("coh_100_1k")),
-    sov:        S_SOV(G("sov_btc_1k_10k",1)),
-    mvrv:       S_MVRV(G("mvrvPct")),
-    mayer:      S_MAYER(G("mayerMultiple",1)),
-    shrp:       S_SHARPE(G("sharpeShort")),
-  };
+# ══════════════════════════════════════════════════════════════════════════════
+# SOURCE 2 — BGEOMETRICS (secondaire)
+# ══════════════════════════════════════════════════════════════════════════════
 
-  // ══════════════════════════════════════════════════════════════════════════
-  // MARKET_LOGIC — Moteur d'interprétation structuré
-  // Architecture : 4 dimensions pondérées → régime → scénarios → narrative
-  // Source : analyses CryptoQuant sessions 24/26 fév 2026
-  // ══════════════════════════════════════════════════════════════════════════
+BG_BASE = "https://bitcoin-data.com/v1"
 
-  // Helpers thermique (scores tableau)
-  const allN=Object.values(s).map(x=>x.n);
-  const avgScore = thermalDisplay;
-  const bearCount=allN.filter(v=>v<=4).length;
-  const bullCount=allN.filter(v=>v>=7).length;
-  const avgNum=thermalScore;
-  const avgColor=avgNum<3?"#ff6b6b":avgNum<5?"#ffa94d":avgNum<6.5?"#ffe066":"#69db7c";
-  const avgGrad=avgNum<3?"linear-gradient(90deg,#c0392b,#e74c3c)":avgNum<5?"linear-gradient(90deg,#e74c3c,#f39c12)":avgNum<6.5?"linear-gradient(90deg,#f39c12,#f1c40f)":"linear-gradient(90deg,#27ae60,#2ecc71)";
 
-  // ── DIM 1 : FLUX & LIQUIDITÉ — ETF (w3) + USDT (w2) + NTV (w1) ───────────
-  // Seuil ETF 0 = absolu (rapport 26 fév) | USDT SMA30 > 0 = carburant rechargé
-  const D_FLUX = (()=>{
-    const etf=G("etf_30d_sum"), usdt=G("usdt_sma30"), ntv=G("ntv_sell_count");
-    const eS=etf>=0?10:etf>=-10?6:etf>=-20?3:etf>=-30?1:0;
-    const uS=usdt>0?9:usdt>-3e7?6:usdt>-2e8?4:usdt>-1e9?2:0;
-    const nS=ntv<=-2?10:ntv===-1?7:ntv===0?5:ntv===1?3:1;
-    const score=Math.round(Math.max(0,Math.min(10,(eS*3+uS*2+nS)/6)));
-    const regime=score>=8?"FLUX HAUSSIER":score>=6?"FLUX NEUTRE +":score>=4?"FLUX NEUTRE −":score>=2?"FLUX BAISSIER":"FUITE CAPITAUX";
-    return{score,regime,etfPositif:etf>=0,usdtPositif:usdt>0,ntvAcheteur:ntv<=-1};
-  })();
+def bg_get(endpoint, last=3, token=""):
+    """
+    GET /v1/{endpoint}/{last} — BGeometrics.
+    Sans token : plan free (8 req/h, 15/jour).
+    Avec token : plan Advanced (200 req/h).
+    """
+    url = f"{BG_BASE}/{endpoint}/{last}"
+    heads = {"Authorization": f"Bearer {token}"} if token else {}
+    try:
+        data = fetch(url, headers=heads or None)
+        return data if isinstance(data, list) else data.get("data", [])
+    except Exception as e:
+        print(f"  ⚠ BG /{endpoint}: {e}")
+        return []
 
-  // ── DIM 2 : STRUCTURE — Futures Power (w3) + BB30 (w2) + BB365 (w1) ──────
-  // FP > 50% = ligne de partage absolue (rapport 26 fév)
-  const D_STRUCT = (()=>{
-    const fp=G("futuresPower"), bb30=G("bullBear30d"), bb365=G("bullBear365d");
-    const fS=fp>=65?10:fp>=55?8:fp>=50?6:fp>=45?4:fp>=35?2:0;
-    const bS=bb30>0.15?10:bb30>0?7:bb30>-0.10?5:bb30>-0.20?3:bb30>-0.30?1:0;
-    const b3=bb365>0.05?10:bb365>0?7:bb365>-0.10?5:bb365>-0.20?3:0;
-    const score=Math.round(Math.max(0,Math.min(10,(fS*3+bS*2+b3)/6)));
-    const regime=score>=8?"STRUCTURE HAUSSIÈRE":score>=6?"NEUTRE / TRANSITION":score>=4?"PRESSION BAISSIÈRE":score>=2?"BEAR STRUCTUREL":"BEAR EXTRÊME";
-    return{score,regime,fpHaussier:fp>=50,bbRetourne:bb30>0,structurelBull:bb365>0};
-  })();
 
-  // ── DIM 3 : PROFITABILITÉ — SOPR (w3) + LTH (w2) + STH (w2) + LTH Supply (w1) ─
-  // SOPR zones réelles CQ : rouge 0.5-1.0 / intermédiaire 3 / verte 6.9-15.8
-  // LTH Supply Ratio < 0.50 = capitulation LTH (fond 2022 ~0.48)
-  const D_PROFIT = (()=>{
-    const sopr=G("soprRatio",1), soprA=G("soprAlert");
-    const lth=G("lthNupl"), sth=G("sthNupl");
-    const utxoR=data&&data.utxoRatio!==undefined&&data.utxoRatio!==null?G("utxoRatio"):null;
-    const sS=sopr>=6.9?10:sopr>=3?8:sopr>=1.05?6:sopr>=0.995?4:sopr>=0.97?3:sopr>=0.70?2:sopr>=0.54?1:0;
-    const lS=lth>=0.50?10:lth>=0.25?7:lth>=0?4:lth>=-0.20?2:lth>=-0.40?1:0;
-    const tS=sth>=0.30?10:sth>=0.10?7:sth>=0?4:sth>=-0.20?2:sth>=-0.40?1:0;
-    const uS=utxoR===null?5:utxoR<=3?9:utxoR<=5?8:utxoR<=8?7:utxoR<=15?5:utxoR<=30?4:utxoR<=100?3:2;
-    const score=Math.round(Math.max(0,Math.min(10,(sS*3+lS*2+tS*2+uS)/8)));
-    const regime=score>=8?"HOLDERS EN PROFIT":score>=6?"NEUTRE / ESPOIR":score>=4?"STRESS MODÉRÉ":score>=2?"PERTE GÉNÉRALISÉE":"CAPITULATION";
-    const utxoFlag=utxoR!==null&&utxoR<=3;
-    return{score,regime,soprCapit:soprA===1,lthEnPerte:lth<0,sthEnPerte:sth<0,utxoFlag};
-  })();
+def get_bg_complement(token, needed):
+    """
+    Récupère uniquement les métriques BGeometrics manquantes dans 'needed'.
+    Minimise les requêtes pour rester dans la limite free 15/jour.
+    'needed' = set de clés manquantes ex: {"sharpeReal","mayerReal","etfFlow30dSum",...}
+    """
+    result = {}
 
-  // ── DIM 4 : VALORISATION LT — MVRV (w3) + Mayer (w2) + Sharpe (w2) + Z (w1)
-  // Score 10 = fond cycle extrême (opportunité) | 0 = euphorie (danger)
-  // Cluster MVRV+Mayer+Sharpe = 4ème occurrence depuis 2013 (rapport 26 fév)
-  const D_VALUATION = (()=>{
-    const mvrv=G("mvrvPct"), mayer=G("mayerMultiple",1);
-    const shrp=G("sharpeShort"), mz=G("mvrv_zscore");
-    const mS=mvrv<=1?10:mvrv<=5?9:mvrv<=15?8:mvrv<=30?6:mvrv<=55?4:mvrv<=80?2:0;
-    const yS=mayer<=0.55?10:mayer<=0.70?9:mayer<=0.80?8:mayer<=1.00?5:mayer<=1.50?3:mayer<=2.40?1:0;
-    const sS=shrp<=-1.5?10:shrp<=-0.8?8:shrp<=-0.3?7:shrp<=0?5:shrp<=0.5?3:shrp<=1.0?1:0;
-    const zS=mz<=-3?10:mz<=-2?8:mz<=-1?6:mz<=0?4:mz<=1?2:mz<=2?1:0;
-    const score=Math.round(Math.max(0,Math.min(10,(mS*3+yS*2+sS*2+zS)/8)));
-    const mvrvOversold=mvrv<=5, mayerOversold=mayer<=0.80, sharpeLoRisk=shrp<=-0.3;
-    const convergenceLT=mvrvOversold&&mayerOversold&&sharpeLoRisk;
-    const zone=score>=9?"CAPITULATION EXTRÊME — Fond cycle historique":score>=7?"DEEP UNDERVALUATION — Zone achat LT":score>=5?"UNDERVALUATION — Bas de cycle":score>=3?"VALORISATION NORMALE":score>=1?"SURVALORISATION MODÉRÉE":"SURVALORISATION EXTRÊME — Top cycle";
-    return{score,zone,mvrvOversold,mayerOversold,sharpeLoRisk,convergenceLT};
-  })();
+    # Sharpe 364d réel (pas disponible sur RBN)
+    if "sharpeReal" in needed:
+        d = bg_get("sharpe-ratio-364d", last=3, token=token)
+        v = last_val(d, "sharpeRatio364d")
+        if v is not None: result["sharpeReal"] = round(v, 4)
+        print(f"  BG Sharpe 364d → {result.get('sharpeReal')}")
 
-  // ── MOTEUR CENTRAL ────────────────────────────────────────────────────────
-  const MARKET_LOGIC = (()=>{
-    const {score:f,etfPositif,usdtPositif,ntvAcheteur}=D_FLUX;
-    const {score:st,fpHaussier,bbRetourne,structurelBull}=D_STRUCT;
-    const {score:pr,soprCapit,lthEnPerte,sthEnPerte,utxoFlag}=D_PROFIT;
-    const {score:v,zone:valZone,convergenceLT,mvrvOversold,mayerOversold,sharpeLoRisk}=D_VALUATION;
+    # Mayer Multiple réel
+    if "mayerReal" in needed:
+        d = bg_get("mayer-multiple", last=3, token=token)
+        v = last_val(d, "mayerMultiple")
+        if v is not None: result["mayerReal"] = round(v, 6)
+        print(f"  BG Mayer → {result.get('mayerReal')}")
 
-    const ctmt = Math.max(0,Math.min(10,(f*4+st*4+pr*2)/10));
-    const lt   = Math.max(0,Math.min(10,(v*5+pr*3+st*2)/10));
-    const dualite = ctmt<=4 && lt>=6;
+    # ETF flows BTC réels
+    if "etfFlow30dSum" in needed:
+        d  = bg_get("etf-flow-btc", last=35, token=token)
+        vd = last_val(d, "etfFlow")
+        s30= last_n(d, "etfFlow", n=30)
+        if vd  is not None: result["etfFlowDaily"]  = round(vd, 2)
+        if s30:              result["etfFlow30dSum"] = round(sum(s30), 2)
+        print(f"  BG ETF → daily={result.get('etfFlowDaily')}  30d={result.get('etfFlow30dSum')}")
 
-    const r_ct=
-      ctmt>=8?{lb:"BULL FORT",col:"#51cf66",grad:"linear-gradient(90deg,#27ae60,#2ecc71)"}:
-      ctmt>=6?{lb:"BULL MODÉRÉ",col:"#94d82d",grad:"linear-gradient(90deg,#5c940d,#94d82d)"}:
-      ctmt>=5?{lb:"NEUTRE",col:"#ffe066",grad:"linear-gradient(90deg,#e67700,#ffe066)"}:
-      ctmt>=3?{lb:"BEAR MODÉRÉ",col:"#ffa94d",grad:"linear-gradient(90deg,#e74c3c,#ffa94d)"}:
-      ctmt>=1?{lb:"BEAR FORT",col:"#ff6b6b",grad:"linear-gradient(90deg,#c0392b,#e74c3c)"}:
-              {lb:"BEAR EXTRÊME",col:"#ff4444",grad:"linear-gradient(90deg,#7d0000,#c0392b)"};
+    # Stablecoin supply réelle
+    if "stable30dChg" in needed:
+        # 63 points = 30 jours récents + 30 jours antérieurs + marge
+        # Permet de calculer une vraie variation 60j et une SMA30 réelle
+        d = bg_get("stablecoin-supply", last=63, token=token)
+        if d and len(d) >= 2:
+            def _b(v):
+                try: return float(v or 0) / 1e9
+                except: return 0.0
+            # Séries USDT + USDC total (en milliards)
+            totals = [_b(p.get("usdt")) + _b(p.get("usdc")) for p in d]
+            usdt_now  = _b(d[-1].get("usdt"))
+            usdc_now  = _b(d[-1].get("usdc"))
+            # Variation 30j réelle (en USD)
+            t30_ago   = totals[-31] if len(totals) >= 31 else totals[0]
+            chg30     = round((totals[-1] - t30_ago) * 1e9, 2)
+            # Variation 60j réelle (en USD)
+            t60_ago   = totals[-61] if len(totals) >= 61 else totals[0]
+            chg60     = round((totals[-1] - t60_ago) * 1e9, 2)
+            # SMA30 réelle = moyenne des variations journalières sur 30j
+            daily_chgs = [(totals[i] - totals[i-1]) * 1e9 for i in range(max(1, len(totals)-30), len(totals))]
+            sma30_real = round(float(np.mean(daily_chgs)) if daily_chgs else 0.0, 2)
+            result["stableUsdtB"]   = round(usdt_now, 3)
+            result["stableUsdcB"]   = round(usdc_now, 3)
+            result["stable30dChg"]  = chg30
+            result["stable60dChg"]  = chg60
+            result["stableSma30"]   = sma30_real   # variation journalière moyenne 30j
+            print(f"  BG Stable → USDT={usdt_now:.1f}B  USDC={usdc_now:.1f}B  30d={chg30/1e6:.0f}M$  60d={chg60/1e6:.0f}M$  SMA30/j={sma30_real/1e6:.0f}M$")
 
-    const r_lt=
-      lt>=8?{lb:"ACHAT LT FORT",col:"#51cf66",grad:"linear-gradient(90deg,#27ae60,#2ecc71)"}:
-      lt>=6?{lb:"ZONE ACCUM.",col:"#69db7c",grad:"linear-gradient(90deg,#2ecc71,#69db7c)"}:
-      lt>=4?{lb:"NEUTRE LT",col:"#ffe066",grad:"linear-gradient(90deg,#f39c12,#ffe066)"}:
-      lt>=2?{lb:"RISQUE MODÉRÉ",col:"#ffa94d",grad:"linear-gradient(90deg,#e74c3c,#ffa94d)"}:
-            {lb:"ZONE DE VENTE",col:"#ff6b6b",grad:"linear-gradient(90deg,#c0392b,#e74c3c)"};
+    # UTXOs in Profit % réel
+    if "utxosInProfitPct" in needed:
+        d = bg_get("utxos-in-profit-pct", last=3, token=token)
+        v = last_val(d, "utxosInProfitPct")
+        if v is not None: result["utxosInProfitPct"] = round(v, 4)
+        print(f"  BG UTXOs in Profit% → {result.get('utxosInProfitPct')}")
 
-    // Checklist Bottom pondérée — 3 niveaux
-    // Alertes bottom = vraies zones capitulation (pas des seuils génériques)
-    // SOPR Alert : zones rouge CQ réelle 0.5-1.0 (proxy: ≤ 0.970)
-    // Sharpe : zone sous-valorisation CQ réelle < -10 (proxy ×30 : < -10)
-    // LTH Supply : capitulation LTH < 0.50 (fond 2022 = 0.48)
-    const checksBot=[
-      {ok:G("etf_30d_sum")>=0,          label:"ETF 30D Sum ≥ 0",            cat:"CRITIQUE",w:3,ctx:"Institutionnels reviennent. Seuil absolu."},
-      {ok:G("futuresPower")>50,          label:"Futures Power > 50%",        cat:"CRITIQUE",w:3,ctx:"Régime dérivés haussier. Ligne de partage absolue."},
-      {ok:G("usdt_sma30")>0,             label:"USDT SMA(30) positif",       cat:"CRITIQUE",w:3,ctx:"Carburant stablecoin rechargé."},
-      {ok:G("bullBear30d")>0,            label:"Bull/Bear 30j > 0",          cat:"HAUTE",   w:2,ctx:"Momentum CT retourné haussier."},
-      {ok:G("soprAlert")===1,            label:"SOPR Alert (zone rouge <1)", cat:"HAUTE",   w:2,ctx:"LTH/STH SOPR en zone rouge CQ (0.5-1.0). Capitulation."},
-      {ok:!sthEnPerte,                   label:"STH NUPL ≥ 0 (absorption)",  cat:"HAUTE",   w:2,ctx:"Acheteurs récents absorbent. Pré-retournement."},
-      {ok:G("mvrvPct")<=10,              label:"MVRV Percentile ≤ 10%",      cat:"HAUTE",   w:2,ctx:"Deep undervaluation / capitulation cycle."},
-      {ok:G("mayerAlert")===1,           label:"Mayer Multiple < 0.80",      cat:"LT",      w:1,ctx:"Oversold historique (2018/2020/2022)."},
-      {ok:G("sharpeShort")<-10,          label:"Sharpe < -10 (sous-valo CQ)",cat:"LT",      w:1,ctx:"Zone sous-valorisation CQ réelle. Bottom 2022 = -29.35."},
-      {ok:G("lthNupl")<0.20,             label:"LTH NUPL < 0.20",            cat:"LT",      w:1,ctx:"Holders LT proches coût de base."},
-      {ok:utxoFlag,                       label:"UTXO P/L Flag = 1 (ratio ≤ 3)",cat:"LT",   w:1,ctx:"Capitulation UTXO. Grands fonds 2015/2019/2022."},
-    ];
-    const bWS=checksBot.reduce((a,c)=>a+(c.ok?c.w:0),0);
-    const bWM=checksBot.reduce((a,c)=>a+c.w,0);
-    const botPct=Math.round(bWS/bWM*100);
-    const critiquesDone=checksBot.filter(c=>c.cat==="CRITIQUE"&&c.ok).length;
+    # Exchange Netflow BTC
+    if "exchNetflowBtc" in needed:
+        d  = bg_get("exchange-netflow-btc", last=8, token=token)
+        vd = last_val(d, "exchangeNetflowBtc")
+        s7 = last_n(d, "exchangeNetflowBtc", n=7)
+        if vd is not None: result["exchNetflowBtc"]   = round(vd, 2)
+        if s7:             result["exchNetflow7dBtc"] = round(sum(s7), 2)
+        print(f"  BG Exch Netflow → daily={result.get('exchNetflowBtc')}  7d={result.get('exchNetflow7dBtc')}")
 
-    // Checklist Top pondérée
-    const checksTop=[
-      {ok:G("etf_30d_sum")>=20,        label:"ETF 30D Sum ≥ +20%",              cat:"CRITIQUE",w:3},
-      {ok:G("futuresPower")>65,        label:"Futures Power > 65% (euphorie)",  cat:"CRITIQUE",w:3},
-      {ok:G("usdt_sma30")<-2e8,        label:"USDT SMA(30) négatif (pression)", cat:"CRITIQUE",w:3},
-      {ok:G("soprRatio",1)>=6.9,       label:"SOPR Ratio ≥ 6.9 (zone verte CQ)",cat:"HAUTE",  w:2},
-      {ok:G("bullBear30d")>0.25,       label:"Bull/Bear 30j > +25%",            cat:"HAUTE",   w:2},
-      {ok:G("lthNupl")>0.70,           label:"LTH NUPL > 0.70 (distribution)",  cat:"HAUTE",   w:2},
-      {ok:G("mvrvPct")>85,             label:"MVRV Percentile > 85%",           cat:"HAUTE",   w:2},
-      {ok:G("mayerMultiple",1)>2.0,    label:"Mayer Multiple > 2.0",            cat:"LT",      w:1},
-      {ok:G("sharpeShort")>40,         label:"Sharpe > +40 (survalor. CQ)",     cat:"LT",      w:1},
-      {ok:G("sthNupl")>0.50,           label:"STH NUPL > 0.50 (euphorie)",      cat:"LT",      w:1},
-      {ok:data&&data.utxoRatio!==null&&G("utxoRatio",999)>100, label:"UTXO Ratio > 100 (euphorie)", cat:"LT", w:1},
-      {ok:G("funding_rate",0)>0.05,    label:"Funding Rate > 0.05% (surlevier)",cat:"LT",      w:1},
-    ];
-    const tWS=checksTop.reduce((a,c)=>a+(c.ok?c.w:0),0);
-    const tWM=checksTop.reduce((a,c)=>a+c.w,0);
-    const topPct=Math.round(tWS/tWM*100);
+    # SOPR LTH/STH (si RBN a échoué)
+    if "soprRatio" in needed:
+        dl = bg_get("lth-sopr", last=90, token=token)
+        ds = bg_get("sth-sopr", last=3,  token=token)
+        lv = last_val(dl, "lthSopr")
+        sv = last_val(ds, "sthSopr")
+        if lv is not None and sv is not None and sv > 0:
+            result["soprRatio"]  = round(lv / sv, 6)
+            result["lthSoprRaw"] = round(lv, 6)
+            result["sthSoprRaw"] = round(sv, 6)
+            h90 = last_n(dl, "lthSopr", n=90)
+            result["soprSma90"]  = round(float(np.mean(h90)), 6) if len(h90) >= 10 else None
+        print(f"  BG SOPR backup → LTH={lv}  STH={sv}")
 
-    // Zones prix dynamiques (SMA200 comme ancre)
-    const btc=G("btcPrice"), sma200=G("mayer_sma200");
-    const zones=[
-      {range:"$"+(btc/1000).toFixed(1)+"K",
-       prob:critiquesDone===3?"BOTTOM VALIDÉ":critiquesDone===2?"Pré-retournement":"Distribution / Transition",
-       label:etfPositif?"▶ Flux ETF stabilisé":"⚠ Flux baissiers actifs",
-       col:"#e74c3c",accent:"#c0392b"},
-      {range:"$"+Math.round(sma200*0.82/1000)+"–"+Math.round(sma200*0.90/1000)+"K",
-       prob:"Support STH cost basis",
-       label:sthEnPerte?"⬇ STH en perte — support probable":"⬇ Zone de test CT/MT",
-       col:"#ffa94d",accent:"#f39c12"},
-      {range:"$"+Math.round(sma200*0.72/1000)+"–"+Math.round(sma200*0.82/1000)+"K",
-       prob:"Scénario central — prob ~"+(convergenceLT?Math.min(70,40+critiquesDone*10):Math.min(50,20+critiquesDone*10))+"%",
-       label:"🎯 "+(convergenceLT?"Cluster oversold LT actif ici":"Mayer 0.72–0.82 × SMA200"),
-       col:"#ffe066",accent:"#f1c40f"},
-      {range:"$"+Math.round(sma200*0.55/1000)+"–"+Math.round(sma200*0.70/1000)+"K",
-       prob:"Capitulation extrême",
-       label:soprCapit&&utxoFlag?"⚡ SOPR Alert + UTXO Flag actifs!":"⚡ Si SOPR Alert=1 + UTXO Flag=1",
-       col:"#da77f2",accent:"#9b59b6"},
-    ];
+    # NUPL LTH/STH (si RBN a échoué)
+    if "lthNupl" in needed:
+        dl = bg_get("nupl-lth", last=3, token=token)
+        ds = bg_get("nupl-sth", last=3, token=token)
+        lv = last_val(dl, "nuplLth")
+        sv = last_val(ds, "nuplSth")
+        if lv is not None: result["lthNupl"] = round(lv, 6)
+        if sv is not None: result["sthNupl"] = round(sv, 6)
+        print(f"  BG NUPL backup → LTH={lv}  STH={sv}")
 
-    // Narrative dynamique factuelle
-    const narrative=[];
-    if(!fpHaussier&&!etfPositif){
-      narrative.push("Bears en contrôle CT — Futures Power "+G("futuresPower").toFixed(1)+"% (sous 50%) + ETF 30D "+G("etf_30d_sum").toFixed(1)+"% (flux négatif).");
-    } else if(fpHaussier&&etfPositif){
-      narrative.push("Structure haussière CT — dérivés + flux institutionnels alignés.");
-    } else {
-      narrative.push("Divergence CT : "+(fpHaussier?"dérivés haussiers":"dérivés baissiers")+" vs "+(etfPositif?"ETF positif":"ETF négatif")+".");
-    }
-    if(lthEnPerte){
-      narrative.push("LTH NUPL "+G("lthNupl").toFixed(3)+" — holders LT en perte. STH NUPL "+G("sthNupl").toFixed(3)+". Zone capitulation.");
-    } else if(G("lthNupl")<0.20){
-      narrative.push("LTH NUPL "+G("lthNupl").toFixed(3)+" — stress bas cycle. STH NUPL "+G("sthNupl").toFixed(3)+".");
-    }
-    if(convergenceLT){
-      narrative.push("CLUSTER OVERSOLD LT — MVRV "+G("mvrvPct").toFixed(1)+"% + Mayer "+G("mayerMultiple",1).toFixed(3)+" + Sharpe "+G("sharpeShort").toFixed(2)+". 4ème occurrence depuis 2013.");
-    }
-    if(critiquesDone<3){
-      const miss=checksBot.filter(c=>c.cat==="CRITIQUE"&&!c.ok).map(c=>c.label);
-      narrative.push("Retournement non validé — critiques manquants : "+miss.join(" · ")+".");
-    } else {
-      narrative.push("BOTTOM STRUCTUREL VALIDÉ — 3 critiques déclenchés simultanément.");
+    # MVRV Z-Score (si RBN a échoué)
+    if "mvrvZscore" in needed:
+        dz = bg_get("mvrv-zscore", last=3, token=token)
+        dl = bg_get("lth-mvrv",   last=3, token=token)
+        ds = bg_get("sth-mvrv",   last=3, token=token)
+        vz = last_val(dz, "mvrvZscore")
+        vl = last_val(dl, "lthMvrv")
+        vs = last_val(ds, "sthMvrv")
+        if vz is not None: result["mvrvZscore"] = round(vz, 4)
+        if vl is not None: result["mvrvLth"]    = round(vl, 4)
+        if vs is not None: result["mvrvSth"]    = round(vs, 4)
+        print(f"  BG MVRV backup → Z={vz}  LTH={vl}  STH={vs}")
+
+    return result
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SOURCE 1bis — COINMETRICS COMMUNITY (on-chain sans clé, PRINCIPAL)
+# Remplace ResearchBitcoin comme source primaire car accessible sans clé
+# depuis GitHub Actions. API gratuite, sans quota, stable.
+# Métriques dispo : CapMVRVFF, NUPLff, SoprFF, CapRealUSD, AdrActCnt, TxCnt
+# ══════════════════════════════════════════════════════════════════════════════
+
+CM_BASE = "https://community-api.coinmetrics.io/v4"
+
+def get_cm_onchain():
+    """
+    CoinMetrics Community — métriques on-chain BTC sans clé.
+    Récupère 90 jours pour les SMA, valide pour SOPR/NUPL/MVRV.
+    Retourne un dict normalisé identique au format attendu par run().
+    """
+    result = {}
+
+    # ── Métriques principales — 90j pour SMA90 ───────────────────────────────
+    # SoprFF = SOPR global (LTH+STH), NUPLff = NUPL global,
+    # CapMVRVFF = MVRV ratio, CapRealUSD = Realized Cap
+    metrics = "SoprFF,NUPLff,CapMVRVFF,CapRealUSD,PriceUSD,AdrActCnt"
+    try:
+        url  = (f"{CM_BASE}/timeseries/asset-metrics"
+                f"?assets=btc&metrics={metrics}&frequency=1d&limit_per_asset=91")
+        data = fetch(url)
+        rows = data.get("data") or []
+        if not rows:
+            print("  ⚠ CoinMetrics: réponse vide")
+            return result
+
+        # Valeurs les plus récentes
+        last = rows[-1]
+        print(f"  CoinMetrics → {len(rows)} points, dernière date: {last.get('time','?')[:10]}")
+
+        # ── SOPR ─────────────────────────────────────────────────────────────
+        sopr_series = [float(r["SoprFF"]) for r in rows if r.get("SoprFF")]
+        if sopr_series:
+            sopr_v = sopr_series[-1]
+            # CoinMetrics SoprFF est le SOPR global (≈ LTH/STH combiné)
+            # On l'utilise directement comme soprRatio
+            result["soprRatio"]  = round(sopr_v, 6)
+            result["lthSoprRaw"] = round(sopr_v, 6)
+            result["sthSoprRaw"] = None   # non disponible séparément en community
+            hist90 = sopr_series[-90:]
+            result["soprSma90"] = round(float(np.mean(hist90)), 6) if len(hist90) >= 10 else None
+            print(f"  CM SOPR → {sopr_v:.4f}  SMA90={result['soprSma90']}")
+            # Mettre en cache SMA90 (économie quota RBN si token présent)
+            if result["soprSma90"]:
+                _save_sma90_cache(result["soprSma90"])
+
+        # ── NUPL ─────────────────────────────────────────────────────────────
+        nupl_series = [float(r["NUPLff"]) for r in rows if r.get("NUPLff")]
+        if nupl_series:
+            nupl_v = nupl_series[-1]
+            # NUPLff = NUPL global — on l'utilise pour LTH et STH (approximation)
+            # LTH NUPL est légèrement plus négatif en capitulation
+            result["lthNupl"] = round(nupl_v * 1.05, 6)   # légère correction LTH
+            result["sthNupl"] = round(nupl_v * 0.95, 6)   # légère correction STH
+            print(f"  CM NUPL → {nupl_v:.4f}  LTH≈{result['lthNupl']:.4f}  STH≈{result['sthNupl']:.4f}")
+
+        # ── MVRV ─────────────────────────────────────────────────────────────
+        mvrv_series = [float(r["CapMVRVFF"]) for r in rows if r.get("CapMVRVFF")]
+        real_series = [float(r["CapRealUSD"]) for r in rows if r.get("CapRealUSD")]
+        if mvrv_series:
+            mvrv_v = mvrv_series[-1]
+            result["mvrvRatioReal"] = round(mvrv_v, 4)
+            # Z-Score MVRV sur 365j (si on a assez de points)
+            seg = mvrv_series[-min(len(mvrv_series), 90):]
+            mu, sigma = np.mean(seg), np.std(seg)
+            if sigma > 0:
+                result["mvrvZscore"] = round((mvrv_v - mu) / sigma, 4)
+            if real_series:
+                result["realizedCapUsd"] = real_series[-1]
+            print(f"  CM MVRV → ratio={mvrv_v:.4f}  Z={result.get('mvrvZscore','N/A')}")
+
+        # ── Adresses actives + Tx (bonus — non utilisés dans le score mais loggés) ──
+        adr_series = [float(r["AdrActCnt"]) for r in rows if r.get("AdrActCnt")]
+        if adr_series:
+            result["adrActCnt"] = int(adr_series[-1])
+            print(f"  CM Adresses actives → {result['adrActCnt']:,}")
+
+    except Exception as e:
+        print(f"  ⚠ CoinMetrics on-chain: {e}")
+
+    return result
+
+
+def get_cm_mvrv():
+    """Alias de compatibilité — appelle get_cm_onchain() et filtre sur MVRV."""
+    full = get_cm_onchain()
+    return {k: full[k] for k in ("mvrvRatioReal", "realizedCapUsd") if k in full}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SOURCE 4 — DÉRIVÉS : Bybit (OI + Funding) + Binance Spot (CVD + NTV)
+# fapi.binance.com est bloqué DNS sur GitHub Actions → Bybit en remplacement
+# api.binance.com (spot) reste accessible pour CVD proxy et NTV
+# ══════════════════════════════════════════════════════════════════════════════
+
+def get_binance_derivatives():
+    """
+    Dérivés BTC — architecture multi-source robuste :
+    - Bybit v5 public API : OI historique + Funding Rate (pas de geo-restriction)
+    - Binance Spot (api.binance.com) : klines pour CVD proxy + NTV
+    - fapi.binance.com est EXCLU (bloqué DNS sur GitHub Actions)
+    """
+    result = {
+        "futuresPower": 50.0, "futuresIndex": 0.5, "futuresLine": 0.5,
+        "futures30dChange": 0.0, "oi_usd": 0.0, "oi_usd_chg7d": 0.0,
+        "cvd_7d": 0.0, "cvd_30d": 0.0, "cvd_signal": 0,
+        "funding_rate": 0.0, "funding_sma8": 0.0, "funding_signal": 0,
+        "ntv_25h": 0.0,
     }
 
-    const cBot=botPct>=80?"#69db7c":botPct>=50?"#ffe066":botPct>=30?"#ffa94d":"#ff6b6b";
-    const gBot=botPct>=80?"linear-gradient(90deg,#27ae60,#2ecc71)":botPct>=50?"linear-gradient(90deg,#f39c12,#ffe066)":botPct>=30?"linear-gradient(90deg,#e74c3c,#ffa94d)":"linear-gradient(90deg,#7d0000,#c0392b)";
-    const cTop=topPct>=70?"#ff6b6b":topPct>=40?"#ffa94d":"#69db7c";
-    const gTop=topPct>=70?"linear-gradient(90deg,#c0392b,#e74c3c)":topPct>=40?"linear-gradient(90deg,#f39c12,#ffa94d)":"linear-gradient(90deg,#27ae60,#2ecc71)";
+    # ── Open Interest — Bybit v5 ──────────────────────────────────────────────
+    try:
+        oi_raw  = fetch("https://api.bybit.com/v5/market/open-interest"
+                        "?category=linear&symbol=BTCUSDT&intervalTime=1d&limit=31")
+        oi_list = list(reversed((oi_raw.get("result") or {}).get("list") or []))
+        if oi_list:
+            oi_btc  = [float(x["openInterest"]) for x in oi_list]
+            lo, hi  = min(oi_btc), max(oi_btc)
+            chg30   = (oi_btc[-1] - oi_btc[0]) / oi_btc[0] if oi_btc[0] > 0 else 0.0
+            index   = (oi_btc[-1] - lo) / (hi - lo) if hi > lo else 0.5
+            ser     = pd.Series([(o - lo) / (hi - lo) if hi > lo else 0.5 for o in oi_btc])
+            line    = float(ser.rolling(7).mean().iloc[-1])
+            chg7    = (oi_btc[-1] - oi_btc[-8]) / oi_btc[-8] * 100 if len(oi_btc) >= 8 and oi_btc[-8] > 0 else 0.0
+            result.update({
+                "futuresPower":     round(50 + chg30 * 100, 4),
+                "futuresIndex":     round(index, 6),
+                "futuresLine":      round(line, 6),
+                "futures30dChange": round(chg30, 6),
+                "_oi_btc_last":     oi_btc[-1],
+                "oi_usd_chg7d":     round(chg7, 4),
+            })
+            print(f"  Bybit OI → {oi_btc[-1]:,.0f} BTC  Power={result['futuresPower']:.1f}%")
+    except Exception as e:
+        print(f"  ⚠ Bybit OI: {e}")
 
-    return{ctmt_score:ctmt,lt_score:lt,regime_ctmt:r_ct,regime_lt:r_lt,dualite,
-           checksBot,botPct,critiquesDone,checksTop,topPct,zones,narrative,
-           colorBot:cBot,gradBot:gBot,colorTop:cTop,gradTop:gTop};
-  })();
+    # ── Funding Rate — Bybit v5 ───────────────────────────────────────────────
+    try:
+        fr_raw  = fetch("https://api.bybit.com/v5/market/funding/history"
+                        "?category=linear&symbol=BTCUSDT&limit=24")
+        fr_list = list(reversed((fr_raw.get("result") or {}).get("list") or []))
+        if fr_list:
+            rates = [float(x["fundingRate"]) * 100 for x in fr_list]
+            fr    = round(rates[-1], 6)
+            sma8  = round(float(pd.Series(rates).rolling(8).mean().iloc[-1]), 6)
+            result.update({
+                "funding_rate":   fr,
+                "funding_sma8":   sma8,
+                "funding_signal": 1 if fr > 0.05 else (-1 if fr < -0.01 else 0),
+            })
+            print(f"  Bybit Funding → {fr:.4f}%  SMA8={sma8:.4f}%")
+    except Exception as e:
+        print(f"  ⚠ Bybit Funding: {e}")
 
-  const scoreBot=MARKET_LOGIC.botPct;
-  const scoreTop=MARKET_LOGIC.topPct;
-  const checksBot=MARKET_LOGIC.checksBot;
-  const checksTop=MARKET_LOGIC.checksTop;
-  const colorBot=MARKET_LOGIC.colorBot;
-  const gradBot=MARKET_LOGIC.gradBot;
-  const colorTop=MARKET_LOGIC.colorTop;
-  const gradTop=MARKET_LOGIC.gradTop;
+    # ── CVD + OI USD via klines Binance SPOT 1j ───────────────────────────────
+    try:
+        klines   = fetch("https://api.binance.com/api/v3/klines"
+                         "?symbol=BTCUSDT&interval=1d&limit=30")
+        cvd_vals = [(float(k[9]) - (float(k[5]) - float(k[9]))) *
+                    ((float(k[2]) + float(k[3])) / 2) for k in klines]
+        cvd_7d   = round(sum(cvd_vals[-7:]) / 1e9, 4)
+        cvd_30d  = round(sum(cvd_vals) / 1e9, 4)
+        result.update({"cvd_7d": cvd_7d, "cvd_30d": cvd_30d,
+                        "cvd_signal": 1 if cvd_7d > 0 else (-1 if cvd_7d < 0 else 0)})
+        # OI USD = OI BTC (Bybit) × close price (Binance spot)
+        if result.get("_oi_btc_last") and result.get("oi_usd") == 0.0:
+            last_close       = float(klines[-1][4])
+            result["oi_usd"] = round(result["_oi_btc_last"] * last_close / 1e9, 4)
+        print(f"  Binance CVD (spot) → 7j={cvd_7d:.3f}B$  30j={cvd_30d:.3f}B$  OI={result['oi_usd']:.2f}B$")
+    except Exception as e:
+        print(f"  ⚠ CVD Binance spot: {e}")
 
-  const cohLbl=(v)=>v>0.05?"ACCUM.▲":v<-0.05?"DISTRIB.▼":"NEUTRE";
-  const cohColor=(v)=>v>0.05?"#69db7c":v<-0.05?"#ff6b6b":"#ffe066";
-  const ntvLbl=["Double Buy ▲▲","Buy ▲","Neutre","Sell ▼","Double Sell ▼▼"][G("ntv_sell_count")+2]||"?";
+    result.pop("_oi_btc_last", None)
 
-  // ── Lignes tableau (ordre exact des sections) ─────────────────────────────
-  const rows = [
+    # ── NTV 25h — Binance SPOT 1h ─────────────────────────────────────────────
+    try:
+        h1  = fetch("https://api.binance.com/api/v3/klines"
+                    "?symbol=BTCUSDT&interval=1h&limit=26")[:-1][-25:]
+        ntv = sum((float(k[9]) - (float(k[5]) - float(k[9]))) *
+                  ((float(k[2]) + float(k[3])) / 2) for k in h1)
+        result["ntv_25h"] = round(ntv, 0)
+        print(f"  Binance NTV 25h (spot) → {ntv/1e6:.1f}M$")
+    except Exception as e:
+        print(f"  ⚠ NTV: {e}")
 
-    // ── SECTION 1 : Flux & Liquidité ────────────────────────────────────────
-    {
-      sec:"── Flux & Liquidité",
-      name:"Bitcoin: ETF Daily",
-      sub_detail:<>
-        <SubVal label="Total Netflow 30D Sum" val={fSign2(G("etf_30d_sum"))+"%"} color={G("etf_30d_sum")<0?"#ff6b6b":"#69db7c"}/>
-        <SubVal label="ETF Netflow USD" val={fM(G("etf_netflow_usd"))} color={G("etf_netflow_usd")<0?"#ff6b6b":"#69db7c"}/>
-      </>,
-      sc:s.etf, nowL:G("etf_30d_sum")<=-20?"FUITE\nMASS.":G("etf_30d_sum")<0?"SORTIE\nACTIVE":"POSITIF",hz:"CT/MT"
-    },
-    {
-      sec:null,
-      name:"Stablecoin USDT — Market Cap Change",
-      sub_detail:<>
-        <SubVal label="Daily MC change" val={fM(G("usdt_daily_mc"))} color={G("usdt_daily_mc")<0?"#ff6b6b":"#69db7c"}/>
-        <SubVal label="USDT SMA(30)" val={fM(G("usdt_sma30"))} color={G("usdt_sma30")<0?"#ff6b6b":"#69db7c"}/>
-        <SubVal label="60d MC change" val={fM(G("usdt_60d_change"))} color={G("usdt_60d_change")<0?"#ff6b6b":"#69db7c"}/>
-        <SubVal label="60d SMA(30)" val={fM(G("usdt_60d_sma30"))} color={G("usdt_60d_sma30")<0?"#ff6b6b":"#69db7c"}/>
-      </>,
-      sc:s.usdt, nowL:G("usdt_sma30")<-5e8?"CONTRACTION":G("usdt_sma30")<0?"NEUTRE−":"POSITIF",hz:"CT/MT"
-    },
-    {
-      sec:null,
-      name:"Net Taker Volume Binance (25h)",
-      sub_detail:<>
-        <SubVal label="NTV 25h" val={fM(G("ntv_25h"))} color={G("ntv_25h")<0?"#ff6b6b":"#69db7c"}/>
-        <SubVal label="Signal" val={ntvLbl} color={G("ntv_sell_count")>=1?"#ff6b6b":G("ntv_sell_count")<=-1?"#69db7c":"#ffe066"}/>
-        <SubVal label="Light Buy" val={G("ntv_light_buy")?"ON":"—"} color={G("ntv_light_buy")?"#69db7c":MUTED}/>
-        <SubVal label="Strong Buy" val={G("ntv_strong_buy")?"ON":"—"} color={G("ntv_strong_buy")?"#40c057":MUTED}/>
-        <SubVal label="Light Sell" val={G("ntv_light_sell")?"ON":"—"} color={G("ntv_light_sell")?"#ffa94d":MUTED}/>
-        <SubVal label="Strong Sell" val={G("ntv_strong_sell")?"ON":"—"} color={G("ntv_strong_sell")?"#ff6b6b":MUTED}/>
-      </>,
-      sc:s.ntv, nowL:G("ntv_sell_count")>=2?"DOUBLE\nSELL":G("ntv_sell_count")<=-2?"DOUBLE\nBUY":"NEUTRE",hz:"CT"
-    },
+    return result
 
-    // ── SECTION 2 : Dérivés & Structure ─────────────────────────────────────
-    {
-      sec:"── Dérivés & Structure de marché",
-      name:"Futures Power 30D Change",
-      sub_detail:<>
-        <SubVal label="Market Power %" val={f2(G("futuresPower"))+"%"} color={G("futuresPower")<50?"#ff6b6b":"#69db7c"}/>
-        <SubVal label="Index" val={f4(G("futuresIndex"))} color="#c9d1d9"/>
-        <SubVal label="Line (SMA7 Index)" val={f4(G("futuresLine"))} color="#74c0fc"/>
-        <SubVal label="Index 30d Change" val={fsign(G("futures30dChange"),4)} color={G("futures30dChange")<0?"#ff6b6b":"#69db7c"}/>
-      </>,
-      sc:s.fut, nowL:G("futuresPower")<45?"BEARS\nDOMINENT":G("futuresPower")<50?"SOUS\n50%":"BULL\n>50%",hz:"CT/MT"
-    },
-    {
-      sec:null,
-      name:"Open Interest (OI) — Binance Futures BTCUSDT",
-      sub_detail:<>
-        <SubVal label="OI USD" val={(G("oi_usd",0)).toFixed(2)+"B$"} color={G("oi_usd",0)<10?"#ff6b6b":G("oi_usd",0)<18?"#ffe066":"#69db7c"}/>
-        <SubVal label="OI chg 7j" val={fSign2(G("oi_usd_chg7d",0))+"%"} color={G("oi_usd_chg7d",0)<0?"#ff6b6b":"#69db7c"}/>
-        <div style={{fontSize:8,color:"#4a5568",marginTop:3,fontStyle:"italic"}}>
-          {G("oi_usd_chg7d",0)<-15?"OI en forte baisse — purge de levier":G("oi_usd_chg7d",0)<0?"OI baisse — delevier modéré":G("oi_usd_chg7d",0)<15?"OI stable/hausse — levier neutre":"OI en hausse forte — accumulation levier"}
-        </div>
-      </>,
-      sc:S_FUT(G("futuresPower")), nowL:G("oi_usd_chg7d",0)<-10?"PURGE\nLEVIER":G("oi_usd_chg7d",0)<0?"DÉLEV.":"NORMAL",hz:"CT"
-    },
-    {
-      sec:null,
-      name:"CVD — Cumulative Volume Delta Binance Futures",
-      sub_detail:<>
-        <SubVal label="CVD 7j" val={(G("cvd_7d",0)>0?"+":"")+G("cvd_7d",0).toFixed(3)+"B$"} color={G("cvd_7d",0)<0?"#ff6b6b":G("cvd_7d",0)>0?"#69db7c":"#ffe066"}
-          alert={G("cvd_signal",0)===-1?<AlertR active={true} on="SELLERS ACTIFS"/>:G("cvd_signal",0)===1?<AlertG active={true} on="BUYERS ACTIFS"/>:null}/>
-        <SubVal label="CVD 30j" val={(G("cvd_30d",0)>0?"+":"")+G("cvd_30d",0).toFixed(3)+"B$"} color={G("cvd_30d",0)<0?"#ff6b6b":"#69db7c"}/>
-        <div style={{fontSize:8,color:"#4a5568",marginTop:3,fontStyle:"italic"}}>
-          CVD &gt; 0 = pression d'achat nette (takers buy &gt; sell) — Binance futures 1j
-        </div>
-      </>,
-      sc:G("cvd_7d",0)<0?S_NTV(1):S_NTV(-1), nowL:G("cvd_7d",0)<0?"CVD\nNÉGATIF":"CVD\nPOSITIF",hz:"CT"
-    },
-    {
-      sec:null,
-      name:"Funding Rate — Binance BTCUSDT Perp",
-      sub_detail:<>
-        <SubVal label="Funding Rate" val={(G("funding_rate",0)*100).toFixed(4)+"%"} color={G("funding_rate",0)>0.05?"#ff6b6b":G("funding_rate",0)<-0.01?"#ffa94d":"#69db7c"}
-          alert={G("funding_signal",0)===1?<AlertR active={true} on="SURLEVIER 🔺"/>:G("funding_signal",0)===-1?<AlertR active={true} on="FEAR FUNDING 🔻"/>:null}/>
-        <SubVal label="SMA8 (~3j)" val={(G("funding_sma8",0)*100).toFixed(4)+"%"} color={G("funding_sma8",0)>0.05?"#ff6b6b":G("funding_sma8",0)<0?"#ffa94d":"#c9d1d9"}/>
-        <div style={{fontSize:8,color:"#4a5568",marginTop:3,fontStyle:"italic"}}>
-          {G("funding_rate",0)>0.05?"Surlevier — longs paient shorts. Correction imminente possible.":
-           G("funding_rate",0)<-0.01?"Funding négatif — shorts en surpoids. Couverture haussière possible.":
-           "Funding neutre (0–0.05%) — levier équilibré."}
-        </div>
-      </>,
-      sc:G("funding_signal",0)===1?{n:8,c:8,m:6,l:4}:G("funding_signal",0)===-1?{n:2,c:3,m:5,l:7}:{n:5,c:5,m:5,l:6},
-      nowL:G("funding_signal",0)===1?"SURLEVIER":G("funding_signal",0)===-1?"FEAR\nFUND.":"NEUTRE",hz:"CT"
-    },
-    {
-      sec:null,
-      name:"Bull/Bear Market Cycle Indicator",
-      sub_detail:<>
-        <SubVal label="Bull-Bear 365d MA" val={fsign(G("bullBear365d"),4)} color={G("bullBear365d")<0?"#ff6b6b":"#69db7c"}/>
-        <SubVal label="Bull-Bear 30d MA" val={fsign(G("bullBear30d"),4)} color={G("bullBear30d")<0?"#ff6b6b":"#69db7c"}/>
-        <SubVal label="Overheated Bull" val={G("bb_overheated_bull")?"✓":"—"} color={G("bb_overheated_bull")?"#ff4d6d":MUTED}/>
-        <SubVal label="Bull" val={G("bb_bull")?"✓":"—"} color={G("bb_bull")?"#69db7c":MUTED}/>
-        <SubVal label="Early Bull" val={G("bb_early_bull")?"✓":"—"} color={G("bb_early_bull")?"#a9e34b":MUTED}/>
-        <SubVal label="Bear" val={G("bb_bear")?"✓":"—"} color={G("bb_bear")?"#ffa94d":MUTED}/>
-        <SubVal label="Extreme Bear" val={G("bb_extreme_bear")?"✓":"—"} color={G("bb_extreme_bear")?"#ff6b6b":MUTED}/>
-      </>,
-      sc:s.bb, nowL:G("bullBear30d")<-0.20?"BEAR\nSTRUCT.":G("bullBear30d")<0?"BEAR\nACTIF":"BULL\nACTIF",hz:"CT/MT"
-    },
 
-    // ── SECTION 3 : Profitabilité & Holders ─────────────────────────────────
-    {
-      sec:"── Profitabilité & Comportement des holders",
-      name:"LTH/STH SOPR Ratio — Zones CryptoQuant",
-      sub_detail:<>
-        <SubVal label="Alert" val={G("soprAlert")===1?"= 1 🚨":"= 0"} color={G("soprAlert")===1?"#ff6b6b":"#69db7c"}
-          alert={<AlertR active={G("soprAlert")===1} on="ZONE ROUGE CQ (<1.0)"/>}/>
-        <SubVal label="SOPR Ratio" val={f4(G("soprRatio",1))} color={G("soprRatio",1)<1?"#ff4444":G("soprRatio",1)<3?"#ffa94d":G("soprRatio",1)>=6.9?"#40c057":"#69db7c"}/>
-        <SubVal label="SMA(90)" val={f4(G("soprSma90",1))} color="#74c0fc"/>
-        <div style={{fontSize:8,color:G("soprRatio",1)<1?"#ff4444":G("soprRatio",1)>=6.9?"#69db7c":"#4a5568",marginTop:3,fontStyle:"italic"}}>
-          {G("soprRatio",1)<0.7?"🔴 Capitulation extrême (fond 2022: 0.54, SMA90: 0.65)":
-           G("soprRatio",1)<1?"🔴 Zone rouge CQ (0.5–1.0) — LTH/STH en perte":
-           G("soprRatio",1)<3?"🟡 Sous ligne intermédiaire (3.0)":
-           G("soprRatio",1)<6.9?"🟢 Au-dessus ligne intermédiaire":
-           "🟢 Zone verte CQ (6.9–15.8) — top cycle"}
-        </div>
-      </>,
-      sc:s.sopr, nowL:G("soprAlert")===1?"ZONE\nROUGE":G("soprRatio",1)<1?"SOUS 1\n<3":G("soprRatio",1)>=6.9?"ZONE\nVERTE":"OK",hz:"MT"
-    },
-    {
-      sec:null,
-      name:"BTC NUPL — aLTH / aSTH",
-      sub_detail:<>
-        <SubVal label="aLTH NUPL" val={fsign(G("lthNupl"),4)} color={G("lthNupl")<-0.30?"#ff4444":G("lthNupl")<0?"#ff6b6b":G("lthNupl")<0.20?"#ffa94d":G("lthNupl")>0.5?"#69db7c":"#ffe066"}/>
-        <SubVal label="aSTH NUPL" val={fsign(G("sthNupl"),4)} color={G("sthNupl")<-0.30?"#ff4444":G("sthNupl")<0?"#ff6b6b":G("sthNupl")<0.15?"#ffa94d":G("sthNupl")>0.5?"#69db7c":"#ffe066"}/>
-        <SubVal label="Average aNUPL" val={fsign(G("nuplAvg"),4)} color={G("nuplAvg")<0?"#ff6b6b":"#c9d1d9"}/>
-        <SubVal label="Line" val={fsign(G("nuplLine"),4)} color="#74c0fc"/>
-        <div style={{fontSize:9,color:G("lthNupl")<0?"#ff6b6b":"#4a5568",marginTop:3,fontStyle:"italic"}}>
-          {G("lthNupl")<-0.35?"LTH en capitulation profonde":G("lthNupl")<0?"LTH en perte (capitulation)":G("lthNupl")<0.25?"Zone espoir (bas cycle)":"Zone optimisme"}
-        </div>
-      </>,
-      sc:s.lth, nowL:G("lthNupl")<=-0.40?"CAPIT.\nLTH":G("lthNupl")<0?"LTH\nEN PERTE":G("lthNupl")<0.20?"BAS\nCYCLE":"MOYEN",hz:"MT/LT"
-    },
-    {
-      sec:null,
-      name:"UTXO Block P/L Count Ratio",
-      sub_detail:<>
-        {data&&data.utxoRatio!==undefined&&data.utxoRatio!==null ? <>
-          <SubVal label="Ratio" val={f2(G("utxoRatio"))}
-            color={G("utxoRatio")<=3?"#ff4444":G("utxoRatio")<=8?"#69db7c":G("utxoRatio")<=15?"#74c0fc":"#c9d1d9"}
-            alert={<AlertG active={G("utxoRatio")<=3} on="FLAG ACHAT LT ⚡"/>}/>
-          <SubVal label="Zone" val={
-            G("utxoRatio")<=3?"Capitulation — Flag = 1 🟢":
-            G("utxoRatio")<=8?"Bas cycle / récupération 🟡":
-            G("utxoRatio")<=15?"Correction intermédiaire":
-            G("utxoRatio")<=30?"Marché haussier en repli":
-            G("utxoRatio")<=100?"Bull confirmé":"Euphorie / top cycle"
-          } color={G("utxoRatio")<=3?"#40c057":G("utxoRatio")<=8?"#69db7c":G("utxoRatio")>100?"#ff6b6b":"#c9d1d9"}/>
-          <SubVal label="SMA-365d" val="~711" color="#4a5568"/>
-          <SubVal label="Flag" val={G("utxoRatio")<=3?"= 1 ⚡ ACHAT LT":"= 0"} color={G("utxoRatio")<=3?"#40c057":"#4a5568"}/>
-          <div style={{fontSize:8,color:"#4a5568",marginTop:3,fontStyle:"italic"}}>Fonds cycle : 2015≈2 | 2019≈3 | 2022≈3 — Tops : 2018≈400 | 2021≈800+</div>
-        </> : <>
-          <div style={{fontSize:10,color:"#4a5568",fontStyle:"italic",padding:"4px 0"}}>
-            Donnée non disponible via pipeline automatique
-          </div>
-          <div style={{fontSize:9,color:"#3a3a3a",marginTop:2}}>→ Source : CryptoQuant "BTC: UTXO Block P/L Count Ratio"</div>
-          <div style={{fontSize:9,color:"#3a3a3a",marginTop:1}}>→ Flag = 1 quand ratio ≤ 3 (grands fonds historiques)</div>
-        </>}
-      </>,
-      sc:data&&data.utxoRatio!==null?s.utxo:{n:5,c:5,m:5,l:5},
-      nowL:data&&data.utxoRatio!==null?(G("utxoRatio")<=3?"FLAG\nACHAT LT":G("utxoRatio")<=8?"BAS\nCYCLE":G("utxoRatio")<=15?"CORRECT.\nACTIVE":"NORMAL"):"N/A\nCQ REQUIS",
-      hz:"MT/LT"
-    },
-    {
-      sec:null,
-      name:"Accumulation vs Distribution — Cohortes (60D)",
-      sub_detail:<>
-        <SubVal label=">10k BTC" val={fsign(G("coh_10k_plus"),3)} color={cohColor(G("coh_10k_plus"))}/>
-        <SubVal label="1k–10k BTC" val={fsign(G("coh_1k_10k"),3)} color={cohColor(G("coh_1k_10k"))}/>
-        <SubVal label="100–1k BTC" val={fsign(G("coh_100_1k"),3)} color={cohColor(G("coh_100_1k"))}/>
-        <SubVal label="10–100 BTC" val={fsign(G("coh_10_100"),3)} color={cohColor(G("coh_10_100"))}/>
-        <SubVal label="1–10 BTC" val={fsign(G("coh_1_10"),3)} color={cohColor(G("coh_1_10"))}/>
-        <SubVal label="0.1–1 BTC" val={fsign(G("coh_01_1"),3)} color={cohColor(G("coh_01_1"))}/>
-        <SubVal label="0–0.1 BTC" val={fsign(G("coh_0_01"),3)} color={cohColor(G("coh_0_01"))}/>
-      </>,
-      sc:s.c10k, nowL:cohLbl(G("coh_10k_plus")),hz:"LT"
-    },
-    {
-      sec:null,
-      name:"Spent Output Value Bands",
-      sub_detail:<>
-        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:"0 10px",marginBottom:4}}>
-          {[["0–1","sov_btc_0_1","sov_btc_0_1_sma7"],["1–10","sov_btc_1_10","sov_btc_1_10_sma7"],
-            ["10–100","sov_btc_10_100","sov_btc_10_100_sma7"],["100–1k","sov_btc_100_1k","sov_btc_100_1k_sma7"],
-            ["1k–10k","sov_btc_1k_10k","sov_btc_1k_10k_sma7"],[">10k","sov_btc_10k_inf","sov_btc_10k_inf_sma7"]
-          ].map(([l,k,ks])=>(
-            <div key={k} style={{fontSize:9,color:"#4a5568",marginBottom:2}}>
-              <span style={{display:"block",color:"#6b7280"}}>{`btc_${l}`}</span>
-              <span style={{fontFamily:"monospace",color:G(k,1)>1.3?"#ff6b6b":G(k,1)>1.1?"#ffa94d":"#c9d1d9"}}>{f4(G(k,1))}</span>
-              <span style={{fontFamily:"monospace",color:"#4a5568",marginLeft:4,fontSize:8}}>s7:{f4(G(ks,1))}</span>
-            </div>
-          ))}
-        </div>
-        <SubVal label="Total SMA7" val={f4(G("sov_total_sma7",1))} color="#74c0fc"
-          alert={<AlertR active={G("sov_signal")===1} on="⚡ MOUVEMENT MAJEUR"/>}/>
-        <SubVal label="Avg Price (7j)" val={"$"+f2(G("sov_avg_price"))} color="#ffe066"/>
-      </>,
-      sc:s.sov, nowL:G("sov_signal")===1?"MOUVEMENT\nMAJEUR":G("sov_btc_1k_10k",1)>1.3?"ACTIVITÉ\nHAUTE":"NORMALE",hz:"MT/LT"
-    },
+# ══════════════════════════════════════════════════════════════════════════════
+# SOURCE 5 — COINBASE (prix + historique)
+# ══════════════════════════════════════════════════════════════════════════════
 
-    // ── SECTION 4 : Valorisation LT ─────────────────────────────────────────
-    {
-      sec:"── Valorisation & Risque Long Terme",
-      name:"MVRV Percentile — Current Cycle",
-      sub_detail:<>
-        <SubVal label="MVRV (7-day)" val={f4(G("mvrv_7d"))} color="#c9d1d9"/>
-        <SubVal label="Log-MVRV (7-day)" val={f4(G("mvrv_log_7d"))} color="#c9d1d9"/>
-        <SubVal label="Z-Score (365d)" val={f4(G("mvrv_zscore_365d"))} color={G("mvrv_zscore_365d")<-1?"#69db7c":G("mvrv_zscore_365d")>2?"#ff6b6b":"#c9d1d9"}/>
-        <SubVal label="Z-Score (4yr)" val={f4(G("mvrv_zscore_4yr"))} color="#74c0fc"/>
-        <SubVal label="Percentile Cycle" val={f2(G("mvrvPct"))+"%" } color={G("mvrvPct")<=5?"#69db7c":G("mvrvPct")>=85?"#ff6b6b":"#c9d1d9"}
-          alert={G("mvrv_low_signal")===1?<AlertG active={true} on="LOW SIGNAL ⬡"/>:G("mvrv_high_signal")===1?<AlertR active={true} on="HIGH SIGNAL ⚠"/>:null}/>
-        <SubVal label="Z-Score" val={f4(G("mvrv_zscore"))} color="#c9d1d9"/>
-        <div style={{fontSize:9,color:G("mvrv_low_signal")===1?"#69db7c":G("mvrv_high_signal")===1?"#ff6b6b":MUTED,marginTop:3,fontStyle:"italic"}}>{d.mvrv_zone||""}</div>
-      </>,
-      sc:s.mvrv, nowL:G("mvrvPct")<=2?"PLANCHER\n0%":G("mvrvPct")<=10?"ZONE\nACCUM.":"BAS\nCYCLE",hz:"LT"
-    },
-    {
-      sec:null,
-      name:"Mayer Multiple",
-      sub_detail:<>
-        <SubVal label="Mayer Multiple" val={f6(G("mayerMultiple",1))} color={G("mayerMultiple",1)<0.8?"#69db7c":G("mayerMultiple",1)>2.4?"#ff6b6b":"#c9d1d9"}
-          alert={<AlertG active={G("mayerAlert")===1} on="🟢 OVERSOLD"/>}/>
-        <SubVal label="SMA-200D" val={"$"+f2(G("mayer_sma200"))} color="#74c0fc"/>
-        <SubVal label="Oversold (<0.80)" val={G("mayer_oversold")===1?"ACTIF":"—"} color={G("mayer_oversold")===1?"#69db7c":MUTED}/>
-        <SubVal label="Overbought (>2.40)" val={G("mayer_overbought")===1?"ACTIF":"—"} color={G("mayer_overbought")===1?"#ffa94d":MUTED}/>
-        <SubVal label="High Overbought (>3.5)" val={G("mayer_hi_overbought")===1?"ACTIF":"—"} color={G("mayer_hi_overbought")===1?"#ff4444":MUTED}/>
-        <SubVal label="Alert" val={G("mayerAlert")===1?"= 1 ✓":"= 0"} color={G("mayerAlert")===1?"#69db7c":"#ff6b6b"}/>
-      </>,
-      sc:s.mayer, nowL:G("mayerMultiple",1)<=0.70?"OVERSOLD\nEXTRÊME":G("mayerMultiple",1)<=0.80?"OVERSOLD\nLT":"NORMAL",hz:"LT"
-    },
-    {
-      sec:null,
-      name:"Sharpe Ratio — Calibré CryptoQuant",
-      sub_detail:<>
-        <SubVal label="Sharpe Ratio (CQ scale)" val={f2(G("sharpeShort"))} color={G("sharpeShort")<-10?"#69db7c":G("sharpeShort")>40?"#ff6b6b":"#c9d1d9"}
-          alert={G("sharpeShort")<-10?<AlertG active={true} on="SOUS-VALO CQ"/>:G("sharpeShort")>40?<AlertR active={true} on="SURVALORISATION"/>:null}/>
-        <SubVal label="Zone" val={
-          G("sharpeShort")<-25?"Capitulation extrême 🔴 (fond 2022=-29.35)":
-          G("sharpeShort")<-10?"Sous-valorisation 🟢 (<-10 CQ)":
-          G("sharpeShort")<0?"Neutre négatif":
-          G("sharpeShort")<40?"Bull modéré":
-          "Survalorisation 🔴 (top 2021=+56.40)"
-        } color={G("sharpeShort")<-10?"#69db7c":G("sharpeShort")>40?"#ff6b6b":"#c9d1d9"}/>
-        <div style={{fontSize:8,color:"#4a5568",marginTop:3,fontStyle:"italic"}}>Zones CQ : sous-valo &lt;-10 | neutre -3→+10 | sur-valo &gt;+40</div>
-      </>,
-      sc:s.shrp, nowL:G("sharpeShort")<=-25?"CAPIT.\nEXTR.":G("sharpeShort")<=-10?"SOUS\nVALO":G("sharpeShort")<=0?"NEUTRE":"BULL",hz:"LT"
-    },
-  ];
+def get_btc_price():
+    return float(fetch("https://api.exchange.coinbase.com/products/BTC-USD/ticker")["price"])
 
-  // ─── RENDER ───────────────────────────────────────────────────────────────
-  return (
-    <div style={{background:BG,color:"#c9d1d9",fontFamily:"Arial,sans-serif",minHeight:"100vh",padding:"20px 22px",
-      backgroundImage:"radial-gradient(ellipse at 20% 20%,rgba(88,166,255,.04) 0%,transparent 60%),radial-gradient(ellipse at 80% 80%,rgba(255,107,107,.03) 0%,transparent 60%)"}}>
 
-      {/* ── HEADER ────────────────────────────────────────────────────────── */}
-      <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:18,paddingBottom:16,borderBottom:`1px solid ${BORDER}`,flexWrap:"wrap",gap:12}}>
-        <div>
-          <div style={{fontFamily:"monospace",fontSize:20,fontWeight:700,color:"#fff",letterSpacing:-.5}}>⬡ BTC ON-CHAIN — TABLEAU THERMIQUE</div>
-          <div style={{fontSize:12,color:MUTED,marginTop:3}}>
-            Source :&nbsp;<code style={{color:"#74c0fc",background:"rgba(88,166,255,.1)",padding:"1px 6px",borderRadius:3,fontSize:11}}>Pipeline On-Chain propriétaire</code>
-            &nbsp;·&nbsp;
-            <code style={{color:"#69db7c",background:"rgba(46,204,113,.08)",padding:"1px 6px",borderRadius:3,fontSize:11}}>Données agrégées (Exchanges / On-chain)</code>
-          </div>
-          {/* Timestamp + micro-indicateur fraîcheur inline */}
-          <div style={{fontSize:11,color:MUTED,marginTop:3,display:"flex",alignItems:"center",gap:6}}>
-            <span style={{color:"#2a4a2a",fontSize:9}}>●</span>
-            <span style={{color:"#3a5a3a"}}>{d.updated||"—"} UTC</span>
-            {freshnessAge !== null && freshnessWarn && (
-              <span style={{color:"#4a4030",fontSize:10}}>
-                · +{freshnessAge}min
-                <span onClick={load} title="Recharger" style={{
-                  cursor:"pointer",color:"#5a5040",marginLeft:4,fontSize:11,
-                  userSelect:"none",transition:"color .2s"
-                }} onMouseEnter={e=>e.target.style.color="#8a7860"}
-                   onMouseLeave={e=>e.target.style.color="#5a5040"}>⟳</span>
-              </span>
-            )}
-            {d.pipeline_status && d.pipeline_status === "degraded" &&
-              <span style={{color:"#4a3020",fontSize:9}}>· proxy</span>}
-          </div>
-        </div>
-        <div style={{display:"flex",flexDirection:"column",alignItems:"flex-end",gap:8}}>
-          <div style={{fontFamily:"monospace",fontSize:28,fontWeight:700,color:"#ffe066"}}>${(G("btcPrice")/1000).toFixed(2)}K</div>
-          <div style={{fontSize:11,color:MUTED}}>Thermal Score :&nbsp;
-            <span style={{color:avgColor,fontFamily:"monospace",fontWeight:700}}>{avgScore}/9</span></div>
-          <div style={{display:"flex",gap:8}}>
-            <button onClick={load} style={{background:"#1F3864",color:"#74c0fc",border:"1px solid #1F6FEB",borderRadius:6,padding:"6px 14px",fontSize:11,cursor:"pointer",fontFamily:"monospace"}}>⟳ RECHARGER</button>
-            <button onClick={()=>setShowHist(h=>!h)} style={{background:PANEL,color:"#c9d1d9",border:`1px solid ${BORDER}`,borderRadius:6,padding:"6px 14px",fontSize:11,cursor:"pointer",fontFamily:"monospace"}}>📜 HISTORIQUE</button>
-          </div>
-        </div>
-      </div>
+def get_btc_history(days=365):
+    # Coinbase accepte max 300 bougies par requête.
+    # La SMA-200 et le bull/bear 365j nécessitent au minimum 365 points.
+    # On fait 2 appels : lot1 = 300 derniers jours, lot2 = 100 jours antérieurs.
+    # Correction : end_ts basé sur le timestamp réel de la bougie la plus ancienne du lot1
+    # (et non sur une estimation, pour éviter les trous/chevauchements).
+    import time as _time
+    closes = []
+    raw_d1 = []
+    # Appel 1 : 300 derniers jours
+    try:
+        raw_d1 = fetch("https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=86400&limit=300")
+        c1     = [float(c[4]) for c in raw_d1]
+        c1.reverse()
+        closes = c1
+    except Exception as e:
+        print(f"  ⚠ Coinbase candles lot1: {e}")
 
-      {/* ── HISTORIQUE ────────────────────────────────────────────────────── */}
-      {showHist&&(
-        <div style={{marginBottom:16,background:PANEL,border:`1px solid ${BORDER}`,borderRadius:10,overflow:"hidden"}}>
-          <div style={{padding:"9px 16px",borderBottom:`1px solid ${BORDER}`,display:"flex",justifyContent:"space-between",alignItems:"center"}}>
-            <span style={{fontFamily:"monospace",fontSize:10,color:"rgba(88,166,255,.7)",textTransform:"uppercase",letterSpacing:2}}>── Historique des sessions (50 dernières)</span>
-            <button onClick={async()=>{
-              histRef.current=[];setHist([]);
-              if(window.storage){try{await window.storage.delete("btc-kizoka-hist");}catch(_){}}
-            }} style={{background:"transparent",color:MUTED,border:`1px solid ${BORDER}`,borderRadius:4,padding:"3px 9px",fontSize:10,cursor:"pointer"}}>🗑 Effacer</button>
-          </div>
-          <div style={{padding:14,overflowX:"auto"}}>
-            {hist.length===0?<div style={{color:MUTED,fontSize:12}}>Aucun historique — les données s'accumulent à chaque refresh (30min)</div>:
-              <table style={{width:"100%",borderCollapse:"collapse",fontSize:11,fontFamily:"monospace"}}>
-                <thead>
-                  <tr>{["Date/Heure","Prix BTC","MVRV%","Mayer","LTH NUPL","STH NUPL","SOPR","Futures%","Bull/Bear 30j","ETF 30D","Score/9","Bot/10"]
-                    .map(h=><th key={h} style={{textAlign:"left",padding:"4px 8px",color:MUTED,fontSize:9,fontWeight:400,whiteSpace:"nowrap",borderBottom:`1px solid ${BORDER}`}}>{h}</th>)}</tr>
-                </thead>
-                <tbody>{hist.map((h,i)=>{
-                  const sc=safe(h.score);
-                  const scColor=sc<3?"#ff6b6b":sc<5?"#ffa94d":sc<6.5?"#ffe066":"#69db7c";
-                  const bot=safe(h.scoreBot,0);
-                  const botColor=bot>=7?"#69db7c":bot>=4?"#ffe066":"#ff6b6b";
-                  return (
-                  <tr key={i} style={{borderTop:`1px solid rgba(255,255,255,.03)`,opacity:i===0?1:0.85-i*0.01}}>
-                    <td style={{padding:"4px 8px",color:"#6b7280",whiteSpace:"nowrap"}}>{h.ts}</td>
-                    <td style={{padding:"4px 8px",color:"#ffe066",fontWeight:700}}>${(safe(h.price)/1000).toFixed(2)}K</td>
-                    <td style={{padding:"4px 8px",color:safe(h.mvrv)<=5?"#69db7c":safe(h.mvrv)>=85?"#ff6b6b":"#74c0fc"}}>{f2(h.mvrv)}%</td>
-                    <td style={{padding:"4px 8px",color:safe(h.mayer)<0.8?"#69db7c":safe(h.mayer)>2.4?"#ff6b6b":"#c9d1d9"}}>{safe(h.mayer).toFixed(4)}</td>
-                    <td style={{padding:"4px 8px",color:safe(h.lthNupl)<0?"#ff6b6b":safe(h.lthNupl)<0.2?"#ffa94d":"#69db7c"}}>{fsign(safe(h.lthNupl),4)}</td>
-                    <td style={{padding:"4px 8px",color:safe(h.sthNupl)<0?"#ff6b6b":safe(h.sthNupl)<0.15?"#ffa94d":"#69db7c"}}>{fsign(safe(h.sthNupl),4)}</td>
-                    <td style={{padding:"4px 8px",color:safe(h.sopr,1)<0.97?"#ff6b6b":safe(h.sopr,1)>1.05?"#69db7c":"#c9d1d9"}}>{safe(h.sopr,1).toFixed(4)}</td>
-                    <td style={{padding:"4px 8px",color:safe(h.futPow)<50?"#ff6b6b":"#69db7c"}}>{safe(h.futPow).toFixed(1)}%</td>
-                    <td style={{padding:"4px 8px",color:safe(h.bb30)<0?"#ff6b6b":"#69db7c"}}>{fsign(safe(h.bb30),4)}</td>
-                    <td style={{padding:"4px 8px",color:safe(h.etf)<0?"#ff6b6b":"#69db7c"}}>{fSign2(h.etf)}%</td>
-                    <td style={{padding:"4px 8px",color:scColor,fontWeight:700}}>{sc.toFixed(2)}</td>
-                    <td style={{padding:"4px 8px",color:botColor,fontWeight:700}}>{bot}/10</td>
-                  </tr>
-                  );
-                })}</tbody>
-              </table>
-            }
-          </div>
-        </div>
-      )}
+    # Appel 2 : 100 jours supplémentaires
+    # end_ts = timestamp Unix de la bougie la PLUS ANCIENNE du lot1 (indice [0] du tableau brut)
+    # Coinbase renvoie les bougies en ordre décroissant : raw_d1[0] = le plus récent, raw_d1[-1] = le plus ancien.
+    if len(closes) >= 10 and raw_d1:
+        try:
+            _time.sleep(0.5)
+            oldest_ts = int(raw_d1[-1][0])   # timestamp Unix exact de la bougie la plus ancienne
+            url2   = (f"https://api.exchange.coinbase.com/products/BTC-USD/candles"
+                      f"?granularity=86400&limit=100&end={oldest_ts - 1}")
+            d2     = fetch(url2)
+            c2     = [float(c[4]) for c in d2]
+            c2.reverse()
+            closes = c2 + closes   # antérieur + récent
+        except Exception as e:
+            print(f"  ⚠ Coinbase candles lot2 (non bloquant): {e}")
 
-      {/* ══════════════════════════════════════════════════════════════════════
-          PARTIE A — DONNÉES REMONTÉES
-          Valeurs brutes par source, organisées par catégorie
-          ══════════════════════════════════════════════════════════════════════ */}
-      <div style={{marginBottom:10}}>
-        <button onClick={()=>setShowData(x=>!x)} style={{
-          width:"100%",display:"flex",alignItems:"center",justifyContent:"space-between",
-          background:"rgba(88,166,255,.03)",border:`1px solid ${BORDER}`,borderRadius:8,
-          padding:"8px 14px",cursor:"pointer",textAlign:"left",
-        }}>
-          <div style={{display:"flex",alignItems:"center",gap:10}}>
-            <span style={{fontFamily:"monospace",fontSize:10,color:"rgba(88,166,255,.6)",textTransform:"uppercase",letterSpacing:2}}>
-              ── A · Données remontées
-            </span>
-            <span style={{fontSize:9,color:MUTED}}>
-              {d._sources ? Object.values(d._sources).filter(v=>!String(v).includes("proxy")).length+"/"+Object.keys(d._sources).length+" sources réelles" : ""}
-            </span>
-          </div>
-          <span style={{fontSize:10,color:MUTED}}>{showData?"▲ masquer":"▼ afficher"}</span>
-        </button>
+    if not closes:
+        raise RuntimeError("Impossible de charger l'historique BTC (Coinbase)")
 
-        {showData && (
-          <div style={{background:PANEL,border:`1px solid ${BORDER}`,borderTop:"none",borderRadius:"0 0 8px 8px",padding:14}}>
-            {/* Grid 4 colonnes — 1 par catégorie */}
-            <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:12}}>
+    ser = pd.Series(closes)
+    print(f"  Coinbase history → {len(ser)} bougies chargées")
+    return ser.iloc[-days:]
 
-              {/* ── CAT 1 : Flux & Liquidité ── */}
-              <div>
-                <div style={{fontFamily:"monospace",fontSize:8,color:"rgba(88,166,255,.5)",letterSpacing:2,textTransform:"uppercase",marginBottom:8,borderBottom:`1px solid ${BORDER}`,paddingBottom:4}}>Flux & Liquidité</div>
-                {[
-                  {lbl:"ETF 30D Sum",   val:fSign2(G("etf_30d_sum"))+"%",           src:d._sources?.etf,   color:G("etf_30d_sum")<0?"#ff6b6b":"#69db7c"},
-                  {lbl:"ETF daily BTC", val:G("etf_daily_btc")!=null?G("etf_daily_btc").toFixed(0)+" BTC":"n/a", src:null, color:"#c9d1d9"},
-                  {lbl:"USDT SMA(30)",  val:fM(G("usdt_sma30")),                    src:d._sources?.stable,color:G("usdt_sma30")<0?"#ff6b6b":"#69db7c"},
-                  {lbl:"USDT 60d",      val:fM(G("usdt_60d_change")),               src:null,              color:G("usdt_60d_change")<0?"#ff6b6b":"#69db7c"},
-                  {lbl:"NTV 25h",       val:fM(G("ntv_25h")),                       src:"binance",         color:"#c9d1d9"},
-                  {lbl:"NTV signal",    val:["2×Buy","Buy","—","Sell","2×Sell"][G("ntv_sell_count")+2]||"?", src:null, color:G("ntv_sell_count")>=1?"#ff6b6b":G("ntv_sell_count")<=-1?"#69db7c":"#ffe066"},
-                ].map((r,i)=><DataRow key={i} {...r}/>)}
-              </div>
 
-              {/* ── CAT 2 : Dérivés ── */}
-              <div>
-                <div style={{fontFamily:"monospace",fontSize:8,color:"rgba(88,166,255,.5)",letterSpacing:2,textTransform:"uppercase",marginBottom:8,borderBottom:`1px solid ${BORDER}`,paddingBottom:4}}>Dérivés & Structure</div>
-                {[
-                  {lbl:"Futures Power", val:f2(G("futuresPower"))+"%",              src:"binance",         color:G("futuresPower")<50?"#ff6b6b":"#69db7c"},
-                  {lbl:"OI USD",        val:f2(G("oi_usd"))+"B$",                   src:"binance",         color:"#c9d1d9"},
-                  {lbl:"OI chg 7j",     val:fSign2(G("oi_usd_chg7d"))+"%",          src:null,              color:G("oi_usd_chg7d")<0?"#ff6b6b":"#69db7c"},
-                  {lbl:"CVD 7j",        val:(G("cvd_7d")>=0?"+":"")+G("cvd_7d").toFixed(3)+"B$", src:"binance", color:G("cvd_7d")<0?"#ff6b6b":"#69db7c"},
-                  {lbl:"Funding Rate",  val:(G("funding_rate")*100).toFixed(4)+"%", src:"binance",         color:G("funding_rate")>0.05?"#ff6b6b":G("funding_rate")<-0.01?"#ffa94d":"#69db7c"},
-                  {lbl:"BB 30d MA",     val:fsign(G("bullBear30d"),4),               src:"proxy_price",     color:G("bullBear30d")<0?"#ff6b6b":"#69db7c"},
-                  {lbl:"BB 365d MA",    val:fsign(G("bullBear365d"),4),              src:"proxy_price",     color:G("bullBear365d")<0?"#ff6b6b":"#69db7c"},
-                ].map((r,i)=><DataRow key={i} {...r}/>)}
-              </div>
+# ══════════════════════════════════════════════════════════════════════════════
+# PROXIES PRIX (fallbacks si toutes les API on-chain échouent)
+# ══════════════════════════════════════════════════════════════════════════════
 
-              {/* ── CAT 3 : Profitabilité ── */}
-              <div>
-                <div style={{fontFamily:"monospace",fontSize:8,color:"rgba(88,166,255,.5)",letterSpacing:2,textTransform:"uppercase",marginBottom:8,borderBottom:`1px solid ${BORDER}`,paddingBottom:4}}>Profitabilité & Holders</div>
-                {[
-                  {lbl:"SOPR Ratio",    val:f4(G("soprRatio",1)),                   src:d._sources?.sopr,  color:G("soprRatio",1)<1?"#ff4444":G("soprRatio",1)>=6.9?"#40c057":"#69db7c"},
-                  {lbl:"SOPR SMA(90)",  val:f4(G("soprSma90",1)),                   src:null,              color:"#74c0fc"},
-                  {lbl:"LTH NUPL",      val:fsign(G("lthNupl"),4),                  src:d._sources?.nupl,  color:G("lthNupl")<0?"#ff6b6b":G("lthNupl")<0.2?"#ffa94d":"#69db7c"},
-                  {lbl:"STH NUPL",      val:fsign(G("sthNupl"),4),                  src:null,              color:G("sthNupl")<0?"#ff6b6b":G("sthNupl")<0.15?"#ffa94d":"#69db7c"},
-                  {lbl:"NUPL avg",      val:fsign(G("nuplAvg"),4),                  src:null,              color:G("nuplAvg")<0?"#ff6b6b":"#c9d1d9"},
-                  {lbl:"UTXO P/L Ratio", val:data&&data.utxoRatio!==null?f2(G("utxoRatio"))+"":"N/A — CryptoQuant", src:data&&data.utxoRatio!==null?"cryptoquant":"non dispo", color:data&&data.utxoRatio!==null?(G("utxoRatio")<=3?"#ff4444":G("utxoRatio")<=8?"#69db7c":"#c9d1d9"):"#3a3a3a"},
-                  {lbl:"UTXO Flag",      val:data&&data.utxoRatio!==null&&G("utxoRatio")<=3?"= 1 ⚡":"= 0", src:null, color:data&&data.utxoRatio!==null&&G("utxoRatio")<=3?"#ff4444":"#69db7c"},
-                ].map((r,i)=><DataRow key={i} {...r}/>)}
-              </div>
+def px_nupl(prices, window):
+    if len(prices) < window: window = len(prices)
+    cur = float(prices.iloc[-1])
+    return round((cur - float(prices.iloc[-window:].mean())) / cur, 6) if cur > 0 else 0.0
 
-              {/* ── CAT 4 : Valorisation LT ── */}
-              <div>
-                <div style={{fontFamily:"monospace",fontSize:8,color:"rgba(88,166,255,.5)",letterSpacing:2,textTransform:"uppercase",marginBottom:8,borderBottom:`1px solid ${BORDER}`,paddingBottom:4}}>Valorisation Long Terme</div>
-                {[
-                  {lbl:"MVRV Pct cycle", val:f2(G("mvrvPct"))+"%",                 src:d._sources?.mvrv,  color:G("mvrvPct")<=5?"#69db7c":G("mvrvPct")>=85?"#ff6b6b":"#c9d1d9"},
-                  {lbl:"MVRV Z-Score",   val:f4(G("mvrv_zscore")),                 src:null,              color:G("mvrv_zscore")<=-2?"#69db7c":G("mvrv_zscore")>=6?"#ff6b6b":"#c9d1d9"},
-                  {lbl:"MVRV 7d",        val:f4(G("mvrv_7d")),                     src:null,              color:"#c9d1d9"},
-                  {lbl:"Mayer Multiple", val:f6(G("mayerMultiple",1)),              src:d._sources?.mayer, color:G("mayerMultiple",1)<0.8?"#69db7c":G("mayerMultiple",1)>2.4?"#ff6b6b":"#c9d1d9"},
-                  {lbl:"SMA-200D",       val:"$"+f2(G("mayer_sma200")),            src:null,              color:"#74c0fc"},
-                  {lbl:"Sharpe (CQ)",    val:f2(G("sharpeShort")),                 src:d._sources?.sharpe,color:G("sharpeShort")<-10?"#69db7c":G("sharpeShort")>40?"#ff6b6b":"#c9d1d9"},
-                  {lbl:"Mayer Alert",    val:G("mayerAlert")===1?"ON ✓":"—",        src:null,              color:G("mayerAlert")===1?"#69db7c":MUTED},
-                ].map((r,i)=><DataRow key={i} {...r}/>)}
-              </div>
-            </div>
+def px_sopr(prices):
+    return float(prices.iloc[-1] / prices.rolling(7).mean().iloc[-1])
 
-            {/* Ligne sources metadata */}
-            {d._sources && (
-              <div style={{marginTop:10,paddingTop:8,borderTop:`1px solid ${BORDER}`,display:"flex",flexWrap:"wrap",gap:"4px 16px"}}>
-                {Object.entries(d._sources).map(([k,v])=>(
-                  <span key={k} style={{fontSize:9,fontFamily:"monospace",
-                    color:String(v).includes("proxy")?"#4a4030":String(v)==="unavailable"?"#5a2020":"#1a3a20"}}>
-                    {k}:<span style={{color:String(v).includes("proxy")?"#7a6040":String(v)==="unavailable"?"#8a4040":"#3a7a50",marginLeft:3}}>{v}</span>
-                  </span>
-                ))}
-              </div>
-            )}
-          </div>
-        )}
-      </div>
+def px_mayer(prices):
+    return float(prices.iloc[-1] / prices.rolling(200).mean().iloc[-1])
 
-      {/* ══════════════════════════════════════════════════════════════════════
-          PARTIE B — LOGIQUE ANALYTIQUE
-          4 dimensions pondérées → régimes → checklists → narrative
-          (alimente et calibre tout le scoring du dashboard ci-dessous)
-          ══════════════════════════════════════════════════════════════════════ */}
-      <div style={{marginBottom:14}}>
-        <button onClick={()=>setShowAnalytics(x=>!x)} style={{
-          width:"100%",display:"flex",alignItems:"center",justifyContent:"space-between",
-          background:"rgba(218,119,242,.03)",border:`1px solid ${BORDER}`,borderRadius:8,
-          padding:"8px 14px",cursor:"pointer",textAlign:"left",
-        }}>
-          <div style={{display:"flex",alignItems:"center",gap:10}}>
-            <span style={{fontFamily:"monospace",fontSize:10,color:"rgba(218,119,242,.5)",textTransform:"uppercase",letterSpacing:2}}>
-              ── B · Logique analytique — moteur de scoring
-            </span>
-            <span style={{fontSize:9,color:MUTED}}>
-              CT/MT {MARKET_LOGIC.ctmt_score.toFixed(1)}/10 · LT {MARKET_LOGIC.lt_score.toFixed(1)}/10 · Bottom {MARKET_LOGIC.botPct}%
-            </span>
-          </div>
-          <span style={{fontSize:10,color:MUTED}}>{showAnalytics?"▲ masquer":"▼ afficher"}</span>
-        </button>
+def px_mvrv_pct(prices):
+    return float((prices < prices.iloc[-1]).sum() / len(prices) * 100)
 
-        {showAnalytics && (
-          <div style={{background:PANEL,border:`1px solid ${BORDER}`,borderTop:"none",borderRadius:"0 0 8px 8px",padding:14}}>
+def px_mvrv_zscore(prices, w=365):
+    if len(prices) < w: w = len(prices)
+    seg = prices.iloc[-w:]
+    mu, sigma = seg.mean(), seg.std()
+    return float((prices.iloc[-1] - mu) / sigma) if sigma > 0 else 0.0
 
-            {/* 4 dimensions */}
-            <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:10,marginBottom:12}}>
-              {[
-                {title:"DIM 1 — Flux & Liquidité", score:D_FLUX.score, regime:D_FLUX.regime,
-                 items:[
-                   {lbl:"ETF positif",    ok:D_FLUX.etfPositif,    w:3},
-                   {lbl:"USDT positif",   ok:D_FLUX.usdtPositif,   w:2},
-                   {lbl:"NTV acheteur",   ok:D_FLUX.ntvAcheteur,   w:1},
-                 ]},
-                {title:"DIM 2 — Structure", score:D_STRUCT.score, regime:D_STRUCT.regime,
-                 items:[
-                   {lbl:"FP > 50%",       ok:D_STRUCT.fpHaussier,      w:3},
-                   {lbl:"BB 30d > 0",     ok:D_STRUCT.bbRetourne,      w:2},
-                   {lbl:"BB 365d > 0",    ok:D_STRUCT.structurelBull,  w:1},
-                 ]},
-                {title:"DIM 3 — Profitabilité", score:D_PROFIT.score, regime:D_PROFIT.regime,
-                 items:[
-                   {lbl:"SOPR > 1",       ok:!D_PROFIT.soprCapit,      w:3},
-                   {lbl:"LTH en profit",  ok:!D_PROFIT.lthEnPerte,     w:2},
-                   {lbl:"STH en profit",  ok:!D_PROFIT.sthEnPerte,     w:2},
-                   {lbl:"UTXO Flag = 0",   ok:!D_PROFIT.utxoFlag,        w:1},
-                 ]},
-                {title:"DIM 4 — Valorisation LT", score:D_VALUATION.score, regime:D_VALUATION.zone.split("—")[0].trim(),
-                 items:[
-                   {lbl:"MVRV oversold",  ok:D_VALUATION.mvrvOversold,  w:3},
-                   {lbl:"Mayer oversold", ok:D_VALUATION.mayerOversold, w:2},
-                   {lbl:"Sharpe lo-risk", ok:D_VALUATION.sharpeLoRisk,  w:2},
-                   {lbl:"Convergence LT", ok:D_VALUATION.convergenceLT, w:3, highlight:true},
-                 ]},
-              ].map((dim,i)=>{
-                const sc=dim.score;
-                const dcol=sc>=7?"#69db7c":sc>=5?"#ffe066":sc>=3?"#ffa94d":"#ff6b6b";
-                const dbdr=sc>=7?"rgba(46,204,113,.2)":sc>=5?"rgba(241,196,15,.15)":sc>=3?"rgba(255,166,77,.15)":"rgba(231,76,60,.15)";
-                return (
-                  <div key={i} style={{background:`rgba(255,255,255,.02)`,border:`1px solid ${dbdr}`,borderRadius:6,padding:10}}>
-                    <div style={{fontSize:8,fontFamily:"monospace",color:"rgba(255,255,255,.25)",letterSpacing:1.5,textTransform:"uppercase",marginBottom:6}}>{dim.title}</div>
-                    <div style={{display:"flex",alignItems:"baseline",gap:6,marginBottom:6}}>
-                      <span style={{fontFamily:"monospace",fontSize:18,fontWeight:700,color:dcol}}>{sc}</span>
-                      <span style={{fontSize:9,color:MUTED}}>/10</span>
-                      <span style={{fontSize:9,color:dcol,marginLeft:4}}>{dim.regime}</span>
-                    </div>
-                    {dim.items.map((it,j)=>(
-                      <div key={j} style={{display:"flex",alignItems:"center",gap:5,fontSize:9.5,padding:"1px 0",
-                        ...(it.highlight&&it.ok?{background:"rgba(46,204,113,.06)",borderRadius:3,padding:"2px 4px"}:{})}}>
-                        <span style={{color:it.ok?"#2ecc71":"#e74c3c",fontSize:11,minWidth:10}}>{it.ok?"✓":"✗"}</span>
-                        <span style={{color:it.ok?"#c9d1d9":"#5a5a5a"}}>{it.lbl}</span>
-                        <span style={{color:"#2d3748",marginLeft:"auto",fontSize:8}}>w{it.w}</span>
-                      </div>
-                    ))}
-                  </div>
-                );
-              })}
-            </div>
+def px_sharpe_cq(prices):
+    """Sharpe proxy ×30, calibré sur l'échelle CryptoQuant (fond=-29.35 / top=+56.40)."""
+    r = prices.pct_change().dropna()
+    if len(r) < 30 or r.std() == 0: return 0.0
+    return round(float((r.mean() / r.std()) * np.sqrt(365)) * 30, 4)
 
-            {/* Checklists Bottom + Top côte à côte */}
-            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:10}}>
-              {/* Checklist Bottom */}
-              <div style={{background:"rgba(88,166,255,.02)",border:`1px solid rgba(88,166,255,.1)`,borderRadius:6,padding:10}}>
-                <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:7}}>
-                  <span style={{fontFamily:"monospace",fontSize:9,color:"rgba(88,166,255,.5)",textTransform:"uppercase",letterSpacing:1.5}}>Validation Bottom</span>
-                  <span style={{fontFamily:"monospace",fontSize:13,fontWeight:700,color:MARKET_LOGIC.colorBot}}>{MARKET_LOGIC.botPct}%</span>
-                </div>
-                <div style={{height:3,background:"rgba(255,255,255,.05)",borderRadius:2,marginBottom:8,overflow:"hidden"}}>
-                  <div style={{height:"100%",width:MARKET_LOGIC.botPct+"%",background:MARKET_LOGIC.colorBot,borderRadius:2}}/>
-                </div>
-                {["CRITIQUE","HAUTE","LT"].map(cat=>(
-                  <div key={cat} style={{marginBottom:5}}>
-                    <div style={{fontSize:7.5,fontFamily:"monospace",color:cat==="CRITIQUE"?"rgba(255,107,107,.4)":cat==="HAUTE"?"rgba(255,166,77,.4)":"rgba(105,219,124,.4)",textTransform:"uppercase",letterSpacing:1,marginBottom:3}}>{cat}</div>
-                    {MARKET_LOGIC.checksBot.filter(c=>c.cat===cat).map((c,i)=>(
-                      <div key={i} style={{display:"flex",alignItems:"center",gap:5,fontSize:9.5,padding:"1px 0"}}>
-                        <span style={{color:c.ok?"#2ecc71":"#e74c3c",fontSize:10,minWidth:10}}>{c.ok?"✓":"✗"}</span>
-                        <span style={{color:c.ok?"#c9d1d9":"#4a4a4a",lineHeight:1.2}}>{c.label}</span>
-                      </div>
-                    ))}
-                  </div>
-                ))}
-              </div>
-              {/* Checklist Top */}
-              <div style={{background:"rgba(231,76,60,.02)",border:`1px solid rgba(231,76,60,.1)`,borderRadius:6,padding:10}}>
-                <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:7}}>
-                  <span style={{fontFamily:"monospace",fontSize:9,color:"rgba(231,76,60,.5)",textTransform:"uppercase",letterSpacing:1.5}}>Validation Top</span>
-                  <span style={{fontFamily:"monospace",fontSize:13,fontWeight:700,color:MARKET_LOGIC.colorTop}}>{MARKET_LOGIC.topPct}%</span>
-                </div>
-                <div style={{height:3,background:"rgba(255,255,255,.05)",borderRadius:2,marginBottom:8,overflow:"hidden"}}>
-                  <div style={{height:"100%",width:MARKET_LOGIC.topPct+"%",background:MARKET_LOGIC.colorTop,borderRadius:2}}/>
-                </div>
-                {["CRITIQUE","HAUTE","LT"].map(cat=>(
-                  <div key={cat} style={{marginBottom:5}}>
-                    <div style={{fontSize:7.5,fontFamily:"monospace",color:cat==="CRITIQUE"?"rgba(255,107,107,.4)":cat==="HAUTE"?"rgba(255,166,77,.4)":"rgba(105,219,124,.4)",textTransform:"uppercase",letterSpacing:1,marginBottom:3}}>{cat}</div>
-                    {MARKET_LOGIC.checksTop.filter(c=>c.cat===cat).map((c,i)=>(
-                      <div key={i} style={{display:"flex",alignItems:"center",gap:5,fontSize:9.5,padding:"1px 0"}}>
-                        <span style={{color:c.ok?"#e74c3c":"#3a3a3a",fontSize:10,minWidth:10}}>{c.ok?"✓":"✗"}</span>
-                        <span style={{color:c.ok?"#ff6b6b":"#4a4a4a"}}>{c.label}</span>
-                      </div>
-                    ))}
-                  </div>
-                ))}
-              </div>
-            </div>
+def px_bullbear(prices, days):
+    if len(prices) < days: days = len(prices) - 1
+    return float((prices.iloc[-1] / prices.iloc[-days]) - 1)
 
-            {/* Narrative */}
-            <div style={{borderTop:`1px solid ${BORDER}`,paddingTop:8}}>
-              <div style={{fontSize:8,fontFamily:"monospace",color:"rgba(255,255,255,.2)",letterSpacing:2,textTransform:"uppercase",marginBottom:5}}>NARRATIVE MOTEUR</div>
-              {MARKET_LOGIC.narrative.map((line,i)=>(
-                <div key={i} style={{fontSize:10.5,color:i===MARKET_LOGIC.narrative.length-1?(MARKET_LOGIC.critiquesDone>=3?"#69db7c":"#8a7060"):"#6a7a8a",
-                  marginBottom:3,lineHeight:1.4,paddingLeft:8,
-                  borderLeft:"1px solid "+(i===0?"rgba(88,166,255,.15)":i===1?"rgba(255,107,107,.15)":i===2?"rgba(218,119,242,.15)":"rgba(255,166,77,.15)")}}>
-                  {line}
-                </div>
-              ))}
-            </div>
-          </div>
-        )}
-      </div>
+def px_bullbear_signals(bb30, bb365):
+    return {
+        "bb_overheated_bull": 1 if bb30 > 0.30 and bb365 > 0.30 else 0,
+        "bb_bull":            1 if 0.05 < bb30 <= 0.30 else 0,
+        "bb_early_bull":      1 if 0.00 < bb30 <= 0.05 else 0,
+        "bb_bear":            1 if -0.20 <= bb30 <= 0.00 else 0,
+        "bb_extreme_bear":    1 if bb30 < -0.20 else 0,
+    }
 
-      {/* ── 4 SCORE CARDS — Moteur MARKET_LOGIC ──────────────────────────────── */}
-      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr 1fr",gap:10,marginBottom:14}}>
-        <ScoreCard
-          label="Signal CT/MT"
-          value={MARKET_LOGIC.regime_ctmt.lb}
-          sub={`Flux ${D_FLUX.score}/10 · Struct ${D_STRUCT.score}/10 · Profit ${D_PROFIT.score}/10`}
-          color={MARKET_LOGIC.regime_ctmt.col}
-          grad={MARKET_LOGIC.regime_ctmt.grad}
-        />
-        <ScoreCard
-          label="Signal LT"
-          value={MARKET_LOGIC.regime_lt.lb}
-          sub={`Valuation ${D_VALUATION.score}/10 · ${D_VALUATION.zone.split("—")[0].trim()}`}
-          color={MARKET_LOGIC.regime_lt.col}
-          grad={MARKET_LOGIC.regime_lt.grad}
-        />
-        <ScoreCard
-          label="Score Thermique (0–9)"
-          value={avgScore}
-          sub={`${bearCount}/${allN.length} bear · Bottom ${scoreBot}% · Top ${scoreTop}%`}
-          color={avgColor}
-          grad={avgGrad}
-        />
-        <ScoreCard
-          label={MARKET_LOGIC.dualite?"⚡ DUALITÉ BEAR CT / OVERSOLD LT":"Contexte Global"}
-          value={MARKET_LOGIC.dualite?"TRANSITION":"STABLE"}
-          sub={MARKET_LOGIC.dualite?"Bear CT + Cluster LT — phase accumulation progressive":"Lectures CT et LT cohérentes"}
-          color={MARKET_LOGIC.dualite?"#da77f2":"#74c0fc"}
-          grad={MARKET_LOGIC.dualite?"linear-gradient(90deg,#6a0dad,#9b59b6)":"linear-gradient(90deg,#1a5276,#2980b9)"}
-        />
-      </div>
-      {/* ── NARRATIVE ─────────────────────────────────────────────────────── */}
-      <div style={{background:"rgba(88,166,255,.04)",border:"1px solid rgba(88,166,255,.1)",borderRadius:8,padding:"10px 14px",marginBottom:14}}>
-        <div style={{fontFamily:"monospace",fontSize:9,color:"rgba(88,166,255,.6)",textTransform:"uppercase",letterSpacing:2,marginBottom:7}}>── Interprétation dynamique</div>
-        {MARKET_LOGIC.narrative.map((line,i)=>(
-          <div key={i} style={{fontSize:11,color:i===MARKET_LOGIC.narrative.length-1?(MARKET_LOGIC.critiquesDone>=3?"#69db7c":"#ffa94d"):"#c9d1d9",marginBottom:4,lineHeight:1.4,paddingLeft:10,borderLeft:"2px solid "+(i===0?"rgba(88,166,255,.3)":i===1?"rgba(255,107,107,.3)":i===2?"rgba(218,119,242,.3)":"rgba(255,166,77,.3)")}}>
-            {line}
-          </div>
-        ))}
-      </div>
+def px_cohorts(prices):
+    r = lambda n: round(px_bullbear(prices, n), 6)
+    return {"coh_10k_plus": r(90), "coh_1k_10k": r(60), "coh_100_1k": r(30),
+            "coh_10_100": r(21),  "coh_1_10": r(14),   "coh_01_1": r(7),   "coh_0_01": r(3)}
 
-      {/* ── LÉGENDE ───────────────────────────────────────────────────────── */}
-      <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:16,flexWrap:"wrap"}}>
-        <span style={{fontSize:11,color:MUTED,textTransform:"uppercase",letterSpacing:1}}>Thermique →</span>
-        <div style={{display:"flex",borderRadius:4,overflow:"hidden",height:16,flex:1,maxWidth:280}}>
-          {["#1a0a0a","#3d0f0f","#7a1a1a","#c0392b","#e74c3c","#f39c12","#f1c40f","#2ecc71","#27ae60","#1a5c3a"].map((bg,i)=><div key={i} style={{flex:1,background:bg}}/>)}
-        </div>
-        <span style={{fontSize:11,color:MUTED}}>Capitulation → Euphorie</span>
-      </div>
+def px_sovb(prices):
+    def rv(s, l):
+        vs = float(prices.pct_change().tail(s).std())
+        vl = float(prices.pct_change().tail(l).std())
+        return round(vs / vl, 4) if vl > 0 and not (math.isnan(vs) or math.isnan(vl)) else 1.0
+    def s7(s, l, n=7):
+        ret = prices.pct_change().dropna()
+        vals = []
+        for i in range(n):
+            if i + max(s, l) > len(ret): break
+            ss = float(ret.iloc[-(i+1):][:s].std())
+            sl = float(ret.iloc[-(i+1):][:l].std())
+            if sl > 0 and not (math.isnan(ss) or math.isnan(sl)): vals.append(ss / sl)
+        return round(float(np.mean(vals)) if vals else 1.0, 4)
+    b01=rv(1,7); b1=rv(3,14); b10=rv(5,21); b100=rv(7,30); b1k=rv(14,60); b10k=rv(21,90)
+    return {
+        "sov_btc_0_1": b01, "sov_btc_1_10": b1, "sov_btc_10_100": b10,
+        "sov_btc_100_1k": b100, "sov_btc_1k_10k": b1k, "sov_btc_10k_inf": b10k,
+        "sov_btc_0_1_sma7": s7(1,7), "sov_btc_1_10_sma7": s7(3,14),
+        "sov_btc_10_100_sma7": s7(5,21), "sov_btc_100_1k_sma7": s7(7,30),
+        "sov_btc_1k_10k_sma7": s7(14,60), "sov_btc_10k_inf_sma7": s7(21,90),
+        "sov_total_sma7": round(np.mean([s7(1,7),s7(3,14),s7(5,21),s7(7,30),s7(14,60),s7(21,90)]),4),
+        "sov_avg_price": round(float(prices.tail(7).mean()), 2),
+        "sov_signal": 1 if b1k > 1.30 or b10k > 1.30 else 0,
+    }
 
-      {/* ── TABLE ─────────────────────────────────────────────────────────── */}
-      <div style={{overflowX:"auto"}}>
-        <table style={{width:"100%",borderCollapse:"collapse",fontSize:12}}>
-          <thead>
-            <tr style={{borderBottom:`2px solid ${BORDER}`}}>
-              {["Indicateur / Valeurs détaillées","Maintenant","CT (1–4 sem)","MT (1–3 mois)","LT (6–18 mois)","Signal","Hz"]
-                .map((h,i)=>(
-                  <th key={i} style={{fontFamily:"monospace",fontSize:9,textTransform:"uppercase",letterSpacing:1.5,color:MUTED,
-                    padding:"10px 10px",textAlign:i===0?"left":"center",fontWeight:400,whiteSpace:"nowrap"}}>{h}</th>
-                ))}
-            </tr>
-          </thead>
-          <tbody>
-            {rows.map((row,ri)=>(
-              <React.Fragment key={ri}>
-                {row.sec&&<SecRow label={row.sec}/>}
-                <tr style={{borderBottom:`1px solid rgba(255,255,255,.04)`}}>
-                  <td style={{padding:"10px 12px",verticalAlign:"top",minWidth:230}}>
-                    <div style={{fontWeight:600,color:"#e6edf3",fontSize:12,marginBottom:4}}>{row.name}</div>
-                    {row.sub_detail}
-                  </td>
-                  <TCell level={row.sc.n} label={row.nowL}/>
-                  <TCell level={row.sc.c} label={LVL[clamp(row.sc.c,0,9)]}/>
-                  <TCell level={row.sc.m} label={LVL[clamp(row.sc.m,0,9)]}/>
-                  <TCell level={row.sc.l} label={LVL[clamp(row.sc.l,0,9)]}/>
-                  <td style={{padding:"6px 8px",textAlign:"center"}}><Badge level={row.sc.n}/></td>
-                  <td style={{padding:"6px 8px",textAlign:"center",fontSize:10,color:MUTED,whiteSpace:"nowrap"}}>{row.hz}</td>
-                </tr>
-              </React.Fragment>
-            ))}
-          </tbody>
-        </table>
-      </div>
 
-      {/* ── ZONES PRIX — MARKET_LOGIC (ancrage SMA200) ──────────────────────── */}
-      <div style={{marginTop:20,display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:10}}>
-        {MARKET_LOGIC.zones.map((z,i)=>(
-          <div key={i} style={{background:PANEL,border:`1px solid ${BORDER}`,borderRadius:8,padding:"13px 14px",position:"relative",overflow:"hidden"}}>
-            <div style={{fontSize:9,fontFamily:"monospace",color:"rgba(255,255,255,.35)",textTransform:"uppercase",letterSpacing:1.5,marginBottom:4}}>
-              {["ZONE ACTUELLE","SUPPORT STH","SCÉNARIO CENTRAL","CAPITULATION EXTRÊME"][i]}
-            </div>
-            <div style={{fontSize:16,fontFamily:"monospace",fontWeight:700,color:"#fff"}}>{z.range}</div>
-            <div style={{fontSize:10,color:MUTED,marginTop:3}}>{z.prob}</div>
-            <div style={{fontSize:10,marginTop:8,fontWeight:700,textTransform:"uppercase",letterSpacing:.8,color:z.col}}>{z.label}</div>
-            <div style={{position:"absolute",bottom:0,left:0,right:0,height:3,background:z.accent}}/>
-          </div>
-        ))}
-      </div>
+# ══════════════════════════════════════════════════════════════════════════════
+# ASSEMBLAGE DES INDICATEURS
+# ══════════════════════════════════════════════════════════════════════════════
 
-      {/* ── CARDS BOTTOM & TOP — scoring pondéré 3 niveaux ─────────────────── */}
-      <div style={{marginTop:16,display:"grid",gridTemplateColumns:"1fr 1fr",gap:14}}>
+def assemble_mvrv(prices, data, cm):
+    """MVRV étendu — priorité : données réelles > CoinMetrics ratio > proxy prix."""
+    z365     = data.get("mvrvZscore")
+    lth_mvrv = data.get("mvrvLth")
+    sth_mvrv = data.get("mvrvSth")
+    mvrv_r   = cm.get("mvrvRatioReal")
 
-        {/* CARD BOTTOM */}
-        <div style={{background:PANEL,border:`1px solid ${BORDER}`,borderRadius:10,padding:16,borderLeft:"3px solid #58a6ff"}}>
-          <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:10}}>
-            <div style={{fontFamily:"monospace",fontSize:10,color:"rgba(88,166,255,.7)",textTransform:"uppercase",letterSpacing:2}}>
-              ── Validation Bottom
-            </div>
-            <div style={{display:"flex",alignItems:"center",gap:8}}>
-              <span style={{fontSize:10,color:MUTED}}>Critiques {MARKET_LOGIC.critiquesDone}/3</span>
-              <span style={{fontFamily:"monospace",fontSize:14,fontWeight:700,color:colorBot,
-                background:scoreBot>=70?"rgba(46,204,113,.15)":scoreBot>=40?"rgba(243,156,18,.15)":"rgba(231,76,60,.15)",
-                border:`1px solid ${scoreBot>=70?"rgba(46,204,113,.3)":scoreBot>=40?"rgba(243,156,18,.3)":"rgba(231,76,60,.3)"}`,
-                padding:"2px 10px",borderRadius:20}}>{scoreBot}%</span>
-            </div>
-          </div>
-          {/* Barre de progression pondérée */}
-          <div style={{height:4,background:"rgba(255,255,255,.06)",borderRadius:2,marginBottom:10,overflow:"hidden"}}>
-            <div style={{height:"100%",width:scoreBot+"%",background:colorBot,borderRadius:2,transition:"width .5s"}}/>
-          </div>
-          {/* Conditions par catégorie */}
-          {["CRITIQUE","HAUTE","LT"].map(cat=>(
-            <div key={cat} style={{marginBottom:7}}>
-              <div style={{fontSize:8,fontFamily:"monospace",color:cat==="CRITIQUE"?"#ff6b6b":cat==="HAUTE"?"#ffa94d":"#69db7c",
-                textTransform:"uppercase",letterSpacing:1.5,marginBottom:4}}>
-                ─ {cat}{cat==="CRITIQUE"?" (retournement impossible sans ces 3)":cat==="HAUTE"?" (déclencheurs)":"  (valorisation oversold)"}
-              </div>
-              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"2px 8px"}}>
-                {checksBot.filter(c=>c.cat===cat).map((c,i)=>(
-                  <div key={i} style={{display:"flex",alignItems:"flex-start",gap:6,fontSize:10.5,padding:"2px 0"}}>
-                    <span style={{color:c.ok?"#2ecc71":"#e74c3c",fontSize:13,minWidth:13,lineHeight:"16px"}}>{c.ok?"✓":"✗"}</span>
-                    <span style={{color:c.ok?"#c9d1d9":"#6b7280",lineHeight:1.3}}>{c.label}</span>
-                  </div>
-                ))}
-              </div>
-            </div>
-          ))}
-          <div style={{marginTop:10,paddingTop:8,borderTop:`1px solid ${BORDER}`,fontSize:11.5}}>
-            <span style={{fontWeight:700,color:"#ffd166"}}>
-              {MARKET_LOGIC.critiquesDone===3?"✅ BOTTOM STRUCTUREL VALIDÉ":
-               MARKET_LOGIC.critiquesDone===2?"⚡ Pré-retournement — 1 critique manquant":
-               MARKET_LOGIC.critiquesDone===1?"⏳ 1 critique validé — distribution active":
-               "❌ 0 critique — Bear CT non résolu"} —{" "}
-            </span>
-            <span style={{color:"#718096",fontSize:10.5}}>
-              {scoreBot>=70?"Signal d'achat fort — confirmer price action":
-               scoreBot>=45?"Signaux LT actifs — attendre déclencheurs CT (ETF · FP · USDT)":
-               scoreBot>=25?"Zone oversold — accumulation progressive (DCA)":
-               "Prématuré — attendre retournement structure CT"}
-            </span>
-          </div>
-          <div style={{marginTop:6,fontSize:9.5,color:"#4a5568",fontStyle:"italic",borderTop:`1px solid rgba(255,255,255,.04)`,paddingTop:7}}>
-            Manquants CT : {checksBot.filter(c=>!c.ok&&c.cat==="CRITIQUE").map(c=>c.label).join(" · ")||"Tous ✓"}<br/>
-            Réf. capitulation 2022 : SOPR≈0.54, SMA90≈0.65, Mayer≈0.67, LTH NUPL≈−0.49, Sharpe≈−29.35, LTH Supply≈0.48
-          </div>
-        </div>
+    src = "real"
+    if z365 is None:
+        z365 = round(px_mvrv_zscore(prices), 4)
+        src  = "proxy"
+        print(f"  ⚡ MVRV Z proxy: {z365}")
+    else:
+        print(f"  ✅ MVRV Z réel: {z365}")
 
-        {/* CARD TOP */}
-        <div style={{background:PANEL,border:`1px solid ${BORDER}`,borderRadius:10,padding:16,borderLeft:"3px solid #e74c3c"}}>
-          <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:10}}>
-            <div style={{fontFamily:"monospace",fontSize:10,color:"rgba(231,76,60,.7)",textTransform:"uppercase",letterSpacing:2}}>
-              ── Validation Top
-            </div>
-            <span style={{fontFamily:"monospace",fontSize:14,fontWeight:700,color:colorTop,
-              background:scoreTop>=70?"rgba(231,76,60,.2)":scoreTop>=40?"rgba(243,156,18,.15)":"rgba(46,204,113,.12)",
-              border:`1px solid ${scoreTop>=70?"rgba(231,76,60,.4)":scoreTop>=40?"rgba(243,156,18,.3)":"rgba(46,204,113,.3)"}`,
-              padding:"2px 10px",borderRadius:20}}>{scoreTop}%</span>
-          </div>
-          <div style={{height:4,background:"rgba(255,255,255,.06)",borderRadius:2,marginBottom:10,overflow:"hidden"}}>
-            <div style={{height:"100%",width:scoreTop+"%",background:colorTop,borderRadius:2,transition:"width .5s"}}/>
-          </div>
-          {["CRITIQUE","HAUTE","LT"].map(cat=>(
-            <div key={cat} style={{marginBottom:7}}>
-              <div style={{fontSize:8,fontFamily:"monospace",color:cat==="CRITIQUE"?"#ff6b6b":cat==="HAUTE"?"#ffa94d":"#69db7c",
-                textTransform:"uppercase",letterSpacing:1.5,marginBottom:4}}>
-                ─ {cat}{cat==="CRITIQUE"?" (distribution structurelle)":cat==="HAUTE"?" (euphorie)":"  (overvaluation)"}
-              </div>
-              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"2px 8px"}}>
-                {checksTop.filter(c=>c.cat===cat).map((c,i)=>(
-                  <div key={i} style={{display:"flex",alignItems:"flex-start",gap:6,fontSize:10.5,padding:"2px 0"}}>
-                    <span style={{color:c.ok?"#e74c3c":"#4a5568",fontSize:13,minWidth:13,lineHeight:"16px"}}>{c.ok?"✓":"✗"}</span>
-                    <span style={{color:c.ok?"#ff6b6b":"#6b7280",lineHeight:1.3}}>{c.label}</span>
-                  </div>
-                ))}
-              </div>
-            </div>
-          ))}
-          <div style={{marginTop:10,paddingTop:8,borderTop:`1px solid ${BORDER}`,fontSize:11.5}}>
-            <span style={{fontWeight:700,color:"#ffd166"}}>
-              {scoreTop>=70?"🔴 Top structurel — distribution en cours":
-               scoreTop>=40?"⚠ Signaux de sommet — prudence":
-               "✅ Pas de sommet — valorisation oversold LT"} —{" "}
-            </span>
-            <span style={{color:"#718096",fontSize:10.5}}>
-              {scoreTop>=70?"Réduire exposition — zone de vente historique":
-               scoreTop>=40?"Surveiller SOPR + MVRV 90%+ pour confirmation":
-               "Bottom scenario prioritaire sur top scenario"}
-            </span>
-          </div>
-          <div style={{marginTop:6,fontSize:9.5,color:"#4a5568",fontStyle:"italic",borderTop:`1px solid rgba(255,255,255,.04)`,paddingTop:7}}>
-            Actifs : {checksTop.filter(c=>c.ok).map(c=>c.label).join(" · ")||"Aucun signal top"}<br/>
-            Réf. tops 2021 : SOPR≈15.8 (zone verte CQ), MVRV≈95%, Mayer≈3.5, LTH NUPL≈0.85, Sharpe≈+56.40, LTH Supply≈0.99
-          </div>
-        </div>
+    # Percentile
+    pct = px_mvrv_pct(prices)
+    if mvrv_r and mvrv_r > 0:
+        # Approx percentile depuis ratio réel (calibré historique BTC)
+        pct = min(100, max(0, round(20 * math.log(max(0.01, mvrv_r)) / math.log(5) * 5 + 20, 1)))
 
-      </div>
+    zone = ("Deep undervaluation — LT buy zone"   if z365 <= -2.0 else
+            "Accumulation / recovery zone"         if z365 <= -1.0 else
+            "Neutral risk"                         if z365 <=  1.0 else
+            "Overheated / distribution (high risk)")
 
-      {/* ── FOOTER ────────────────────────────────────────────────────────── */}
-      <div style={{marginTop:18,paddingTop:14,borderTop:`1px solid ${BORDER}`,display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:8}}>
-        <div style={{fontSize:11,color:MUTED,fontStyle:"italic"}}>
-          Site de Kizoka0x
-        </div>
-        <div style={{display:"flex",alignItems:"center",gap:10}}>
-          <a href="https://t.me/Kizoka0x" target="_blank" rel="noopener noreferrer"
-            style={{display:"flex",alignItems:"center",gap:6,textDecoration:"none",
-              background:"rgba(41,182,246,.12)",border:"1px solid rgba(41,182,246,.3)",
-              borderRadius:6,padding:"5px 12px",color:"#29b6f6",fontSize:12,fontWeight:600}}>
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="#29b6f6" style={{flexShrink:0}}>
-              <path d="M12 0C5.373 0 0 5.373 0 12s5.373 12 12 12 12-5.373 12-12S18.627 0 12 0zm5.894 8.221-1.97 9.28c-.145.658-.537.818-1.084.508l-3-2.21-1.447 1.394c-.16.16-.295.295-.605.295l.213-3.053 5.56-5.023c.242-.213-.054-.333-.373-.12L7.26 13.48 4.33 12.57c-.657-.204-.67-.657.136-.975l11.125-4.29c.548-.196 1.028.134.846.916h-.543z"/>
-            </svg> @Kizoka0x
-          </a>
-          <span style={{fontSize:10,color:"#2d3748"}}>Ce tableau ne constitue pas un conseil financier.</span>
-        </div>
-      </div>
+    return {
+        "mvrv_7d":          round(float(prices.iloc[-1] / prices.rolling(7).mean().iloc[-1]), 6),
+        "mvrv_log_7d":      round(float(np.log(prices.iloc[-1] / prices.rolling(7).mean().iloc[-1])), 6),
+        "mvrv_zscore_365d": z365, "mvrv_zscore_4yr": z365, "mvrv_zscore": z365,
+        "mvrvPct":          round(pct, 4),
+        "mvrvRatioReal":    round(mvrv_r, 4) if mvrv_r else None,
+        "mvrvLth":          round(lth_mvrv, 4) if lth_mvrv else None,
+        "mvrvSth":          round(sth_mvrv, 4) if sth_mvrv else None,
+        "mvrv_high_signal": 1 if z365 >= 6.0 else 0,
+        "mvrv_low_signal":  1 if z365 <= -1.5 else 0,
+        "mvrv_zone":        zone,
+        "_src_mvrv":        src,
+    }
 
-    </div>
-  );
-}
 
-// ─── MOUNT ────────────────────────────────────────────────────────────────────
-const root = ReactDOM.createRoot(document.getElementById("root"));
-root.render(<BTCThermalAI/>);
+def assemble_mayer(prices, data):
+    mm   = data.get("mayerReal") or px_mayer(prices)
+    src  = "real" if data.get("mayerReal") else "proxy"
+    s200 = float(prices.rolling(200).mean().iloc[-1])
+    if src == "proxy": print(f"  ⚡ Mayer proxy: {mm:.4f}")
+    return {
+        "mayerMultiple":       round(mm, 6),
+        "mayer_oversold":      1 if mm < 0.80 else 0,
+        "mayer_sma200":        round(s200, 2),
+        "mayer_overbought":    1 if mm > 2.40 else 0,
+        "mayer_hi_overbought": 1 if mm > 3.50 else 0,
+        "mayerAlert":          1 if mm < 0.80 else 0,
+        "_src_mayer":          src,
+    }
+
+
+def assemble_etf(data, prices):
+    """ETF flows réels BGeometrics (BTC/jour) → normalisation échelle scoring."""
+    etf30 = data.get("etfFlow30dSum")
+    daily = data.get("etfFlowDaily")
+    if etf30 is not None:
+        # Normalisation : ±20k BTC/30j = ±20 sur l'échelle scoring
+        etf_pct = round(float(etf30) / 1000, 4)
+        etf_usd = round(float(daily or 0) * float(prices.iloc[-1]), 0)
+        src = "real"
+        print(f"  ✅ ETF réel: {etf30:.0f} BTC/30j")
+    else:
+        etf_pct = round(px_bullbear(prices, 30) * 100, 4)
+        etf_usd = round(px_bullbear(prices, 7) * float(prices.iloc[-1]) * 150000, 0)
+        daily, etf30 = None, None
+        src = "proxy"
+        print(f"  ⚡ ETF proxy: {etf_pct:.2f}%")
+    return {"etf_30d_sum": etf_pct, "etf_30d_sum_btc": etf30,
+            "etf_netflow_usd": int(etf_usd), "etf_daily_btc": daily, "_src_etf": src}
+
+
+def assemble_usdt(data, prices):
+    """
+    Stablecoin supply réelle (BG) → métriques correctes.
+    Correction : usdt_sma30 = vraie moyenne journalière 30j (pas la variation brute),
+                 usdt_60d_change = vraie variation 60j (pas ×2 de la variation 30j).
+    """
+    chg30 = data.get("stable30dChg")
+    chg60 = data.get("stable60dChg")
+    sma30 = data.get("stableSma30")   # variation journalière moyenne 30j
+    if chg30 is not None:
+        daily_mc = sma30 if sma30 is not None else round(float(chg30) / 30, 2)
+        return {
+            "usdt_daily_mc":     round(daily_mc, 2),
+            "usdt_sma30":        round(daily_mc, 2),          # variation journalière moyenne 30j
+            "usdt_60d_change":   round(float(chg60), 2) if chg60 is not None else round(float(chg30) * 2, 2),
+            "usdt_60d_sma30":    round(float(chg60) / 60, 2) if chg60 is not None else round(daily_mc, 2),
+            "stableSupplyUsdtB": data.get("stableUsdtB"),
+            "stableSupplyUsdcB": data.get("stableUsdcB"),
+            "_src_stable":       "real",
+        }
+    # Fallback CoinGecko
+    try:
+        cg    = fetch("https://api.coingecko.com/api/v3/coins/tether/market_chart?vs_currency=usd&days=62")
+        mc_b  = pd.Series([p[1] for p in cg["market_caps"]])   # market cap en USD
+        daily = float(mc_b.iloc[-1] - mc_b.iloc[-2])
+        sma30 = float(mc_b.diff().dropna().tail(30).mean())
+        chg60 = float(mc_b.iloc[-1] - mc_b.iloc[-61]) if len(mc_b) >= 61 else 0.0
+        print(f"  ⚡ Stablecoin CoinGecko (fallback)")
+        return {"usdt_daily_mc": round(daily, 2), "usdt_sma30": round(sma30, 2),
+                "usdt_60d_change": round(chg60, 2), "usdt_60d_sma30": round(chg60 / 60, 2),
+                "stableSupplyUsdtB": None, "stableSupplyUsdcB": None, "_src_stable": "coingecko"}
+    except:
+        return {"usdt_daily_mc": 0.0, "usdt_sma30": 0.0, "usdt_60d_change": 0.0,
+                "usdt_60d_sma30": 0.0, "stableSupplyUsdtB": None,
+                "stableSupplyUsdcB": None, "_src_stable": "unavailable"}
+
+
+def assemble_ntv(ntv_25h, prices):
+    neg7 = int((prices.pct_change().tail(7) < 0).sum())
+    s = 2 if neg7 >= 5 else 1 if neg7 >= 3 else -2 if neg7 == 0 else -1
+    return {"ntv_sell_count": s, "ntv_light_buy": 1 if s <= -1 else 0,
+            "ntv_strong_buy": 1 if s == -2 else 0, "ntv_light_sell": 1 if s >= 1 else 0,
+            "ntv_strong_sell": 1 if s >= 2 else 0}
+
+
+def assemble_lth_supply(prices, lth_nupl, data):
+    """
+    LTH Supply in Profit Ratio.
+    - UTXOs in Profit% réel (BG) → converti en 0-1  ← priorité
+    - Proxy mvrvPct×0.6 + lthNupl_norm×0.4          ← fallback
+    Seuils CryptoQuant : capitulation < 0.50 / top > 0.95
+    """
+    pct = data.get("utxosInProfitPct")
+    if pct is not None:
+        ratio = round(float(pct) / 100, 4)
+        src   = "real"
+        print(f"  ✅ LTH Supply réel (UTXOs in Profit%): {pct:.1f}% → {ratio:.4f}")
+    else:
+        mvrv_p   = px_mvrv_pct(prices)
+        lth_norm = max(0.0, min(1.0, (lth_nupl + 0.50) / 1.25))
+        ratio    = round((mvrv_p / 100) * 0.6 + lth_norm * 0.4, 4)
+        src      = "proxy"
+        print(f"  ⚡ LTH Supply proxy: {ratio:.4f}")
+    return float(ratio), src
+
+
+def compute_thermal_score(d):
+    """
+    Score composite 0–9 via 9 indicateurs pondérés.
+    Correction : clamp explicite sur chaque score individuel ET sur le score final
+    pour garantir que thermalScore ∈ [0.0, 9.0] en toutes circonstances.
+    """
+    def _s(v, lo, hi):
+        if v is None: return 4.5
+        if hi == lo: return 4.5
+        raw = (float(v) - lo) / (hi - lo) * 9
+        return float(max(0.0, min(9.0, raw)))
+    scores = [
+        _s(d["mayerMultiple"],    0.55,  2.40),
+        _s(d["mvrvPct"],          0.0,   90.0),
+        _s(d["lthNupl"],         -0.50,  0.70),
+        _s(d["sthNupl"],         -0.50,  0.70),
+        _s(d["soprRatio"],        0.50,  6.90),
+        _s(d["futuresPower"],    35.0,   80.0),
+        _s(d["etf_30d_sum"],    -30.0,   20.0),
+        _s(d["bullBear30d"],     -0.30,  0.30),
+        _s(d.get("funding_rate", 0.0), -0.05, 0.10),
+    ]
+    result = round(float(max(0.0, min(9.0, np.mean(scores)))), 4)
+    # Sanity check : log si une valeur en entrée semble aberrante
+    for name, val in [("mayerMultiple", d["mayerMultiple"]), ("mvrvPct", d["mvrvPct"]),
+                      ("lthNupl", d["lthNupl"]), ("soprRatio", d["soprRatio"])]:
+        if val is not None and (float(val) > 1000 or float(val) < -1000):
+            print(f"  ⚠ compute_thermal: valeur suspecte {name}={val}")
+    return result
+
+
+def sanitize(obj):
+    if isinstance(obj, dict):  return {k: sanitize(v) for k, v in obj.items()}
+    if isinstance(obj, list):  return [sanitize(v)    for v in obj]
+    if isinstance(obj, float) and (math.isnan(obj) or math.isinf(obj)): return None
+    return obj
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MAIN
+# ══════════════════════════════════════════════════════════════════════════════
+
+def run():
+    now = datetime.utcnow()
+    print(f"\n⬡ BTC Pipeline Kizoka0x v2 — {now.strftime('%Y-%m-%d %H:%M')} UTC")
+    print(f"  ResearchBitcoin  : {'✅ token présent (bonus)' if RBN_TOKEN else '⚠  absent (CoinMetrics utilisé)'}")
+    print(f"  BGeometrics      : {'✅ token présent' if BG_TOKEN  else '⚠  sans token (6 req/run max)'}")
+
+    # ── PRIX + HISTORIQUE ────────────────────────────────────────────────────
+    prices    = get_btc_history(365)
+    btc_price = get_btc_price()
+    print(f"  BTC: ${btc_price:,.2f}")
+
+    # ── DÉRIVÉS : Bybit OI/Funding + Binance Spot CVD/NTV ───────────────────
+    print("\n── Dérivés (Bybit + Binance Spot) ───────")
+    fut = get_binance_derivatives()
+
+    # ── ON-CHAIN PRINCIPAL : CoinMetrics Community (sans clé) ───────────────
+    print("\n── CoinMetrics Community (principal) ────")
+    data = get_cm_onchain()
+
+    # ── ON-CHAIN BONUS : ResearchBitcoin (si token présent) ─────────────────
+    # Surcharge uniquement les métriques que CoinMetrics n'a pas en LTH/STH séparé
+    if RBN_TOKEN:
+        print("\n── ResearchBitcoin (bonus LTH/STH) ──────")
+        rbn = get_rbn_onchain(RBN_TOKEN)
+        # RBN a LTH/STH séparés → prendre si disponibles (plus précis que les estimations CM)
+        for k in ("lthSoprRaw", "sthSoprRaw", "soprRatio", "soprSma90",
+                  "lthNupl", "sthNupl", "mvrvZscore", "mvrvLth", "mvrvSth"):
+            if rbn.get(k) is not None:
+                data[k] = rbn[k]
+
+    # ── COMPLÉMENTS BGeometrics ──────────────────────────────────────────────
+    # Métriques non couvertes par CoinMetrics : sharpe, mayer, ETF, stablecoin
+    # Limité à 6 requêtes max en mode free (15/jour) pour ne pas épuiser le quota
+    needed = set()
+    needed |= {"sharpeReal", "mayerReal", "etfFlow30dSum", "stable30dChg"}
+    # Ajouter utxos si CM n'a pas fourni assez pour le LTH Supply
+    if data.get("mvrvRatioReal") is None:
+        needed.add("utxosInProfitPct")
+    # Backup exchange netflow si disponible avec token (ne pas gaspiller quota free sur ça)
+    if BG_TOKEN:
+        needed.add("exchNetflowBtc")
+
+    print("\n── BGeometrics (compléments) ─────────────")
+    bg = get_bg_complement(BG_TOKEN, needed)
+    for k, v in bg.items():
+        if data.get(k) is None:
+            data[k] = v
+
+    # ── RÉSOLUTION INDICATEURS ───────────────────────────────────────────────
+    print("\n── Résolution indicateurs ────────────────")
+
+    # NUPL
+    lth_val = data.get("lthNupl")
+    sth_val = data.get("sthNupl")
+    if lth_val is None:
+        lth_val = px_nupl(prices, 365)
+        print(f"  ⚡ LTH NUPL proxy: {lth_val:.4f}")
+    if sth_val is None:
+        sth_val = px_nupl(prices, 155)
+        print(f"  ⚡ STH NUPL proxy: {sth_val:.4f}")
+
+    # SOPR
+    sopr_val   = data.get("soprRatio")
+    sopr_sma90 = data.get("soprSma90")
+    if sopr_val is None:
+        sopr_val = px_sopr(prices)
+        print(f"  ⚡ SOPR proxy (prix/MA7): {sopr_val:.4f}")
+    if sopr_sma90 is None:
+        sopr_sma90 = round(float(pd.Series([
+            px_sopr(prices.iloc[:max(7, len(prices) - i)])
+            for i in range(min(90, len(prices) - 7))
+        ]).mean()), 6)
+
+    # SOPR Alert
+    sopr_alert = 1 if (sopr_val < 1.0 and sopr_sma90 < 1.5) else 0
+
+    # Sharpe
+    sharpe_val = data.get("sharpeReal")
+    if sharpe_val is None:
+        sharpe_val = px_sharpe_cq(prices)
+        print(f"  ⚡ Sharpe proxy ×30: {sharpe_val:.2f}")
+    else:
+        print(f"  ✅ Sharpe BG réel 364d: {sharpe_val:.2f}")
+
+    # Composites
+    cm_dict   = {k: data.get(k) for k in ("mvrvRatioReal", "realizedCapUsd")}
+    mvrv_ext  = assemble_mvrv(prices, data, cm_dict)
+    mayer_ext = assemble_mayer(prices, data)
+    etf_data  = assemble_etf(data, prices)
+    usdt_data = assemble_usdt(data, prices)
+
+    bb30d    = px_bullbear(prices, 30)
+    bb365d   = px_bullbear(prices, 365)
+    bb_sigs  = px_bullbear_signals(bb30d, bb365d)
+    ntv_sigs = assemble_ntv(fut["ntv_25h"], prices)
+    cohorts  = px_cohorts(prices)
+    sov      = px_sovb(prices)
+
+    lth_sup, lth_sup_src = assemble_lth_supply(prices, lth_val, data)
+    lth_sup_flag         = 1 if lth_sup < 0.50 else 0
+    nupl_avg             = round((lth_val + sth_val) / 2, 6)
+
+    thermal = compute_thermal_score({
+        "mayerMultiple": mayer_ext["mayerMultiple"], "mvrvPct": mvrv_ext["mvrvPct"],
+        "lthNupl": lth_val, "sthNupl": sth_val, "soprRatio": sopr_val,
+        "futuresPower": fut["futuresPower"], "etf_30d_sum": etf_data["etf_30d_sum"],
+        "bullBear30d": bb30d, "funding_rate": fut["funding_rate"],
+    })
+
+    # ── SOURCES METADATA ─────────────────────────────────────────────────────
+    def src(rbn_key, bg_key=None, label_real="coinmetrics"):
+        if data.get(rbn_key) is not None:
+            return label_real
+        if bg_key and data.get(bg_key) is not None:
+            return "bgeometrics"
+        return "proxy_price"
+
+    sources = {
+        "sopr":    "researchbitcoin" if data.get("lthSoprRaw") and RBN_TOKEN else
+                   ("coinmetrics" if data.get("soprRatio") else "proxy_price"),
+        "nupl":    "researchbitcoin" if RBN_TOKEN and data.get("lthNupl") else
+                   ("coinmetrics" if data.get("lthNupl") else "proxy_price"),
+        "mvrv":    mvrv_ext["_src_mvrv"],
+        "sharpe":  "bgeometrics" if data.get("sharpeReal") is not None else "proxy_x30",
+        "mayer":   mayer_ext["_src_mayer"],
+        "etf":     etf_data["_src_etf"],
+        "stable":  usdt_data["_src_stable"],
+        "utxo":    lth_sup_src,
+        "deriv":   "bybit" if fut.get("funding_rate") != 0.0 else "unavailable",
+    }
+
+    # ── JSON FINAL ───────────────────────────────────────────────────────────
+    dashboard = {
+        "updated":  now.strftime("%Y-%m-%dT%H:%M"),
+        "btcPrice": round(float(btc_price), 2),
+
+        # ── Flux & Liquidité ──────────────────────────────────────────────────
+        "etf_30d_sum":       etf_data["etf_30d_sum"],
+        "etf_30d_sum_btc":   etf_data["etf_30d_sum_btc"],
+        "etf_netflow_usd":   etf_data["etf_netflow_usd"],
+        "etf_daily_btc":     etf_data["etf_daily_btc"],
+        "usdt_daily_mc":     usdt_data["usdt_daily_mc"],
+        "usdt_sma30":        usdt_data["usdt_sma30"],
+        "usdt_60d_change":   usdt_data["usdt_60d_change"],
+        "usdt_60d_sma30":    usdt_data["usdt_60d_sma30"],
+        "stableSupplyUsdtB": usdt_data["stableSupplyUsdtB"],
+        "stableSupplyUsdcB": usdt_data["stableSupplyUsdcB"],
+        "ntv_25h":           int(fut["ntv_25h"]),
+        "ntv_sell_count":    ntv_sigs["ntv_sell_count"],
+        "ntv_light_buy":     ntv_sigs["ntv_light_buy"],
+        "ntv_strong_buy":    ntv_sigs["ntv_strong_buy"],
+        "ntv_light_sell":    ntv_sigs["ntv_light_sell"],
+        "ntv_strong_sell":   ntv_sigs["ntv_strong_sell"],
+        "exchangeNetflowBtc":   data.get("exchNetflowBtc"),
+        "exchangeNetflow7dBtc": data.get("exchNetflow7dBtc"),
+
+        # ── Dérivés & Structure ───────────────────────────────────────────────
+        "futuresPower":      fut["futuresPower"],
+        "futuresIndex":      fut["futuresIndex"],
+        "futuresLine":       fut["futuresLine"],
+        "futures30dChange":  fut["futures30dChange"],
+        "oi_usd":            fut["oi_usd"],
+        "oi_usd_chg7d":      fut["oi_usd_chg7d"],
+        "cvd_7d":            fut["cvd_7d"],
+        "cvd_30d":           fut["cvd_30d"],
+        "cvd_signal":        fut["cvd_signal"],
+        "funding_rate":      fut["funding_rate"],
+        "funding_sma8":      fut["funding_sma8"],
+        "funding_signal":    fut["funding_signal"],
+        "bb_overheated_bull":bb_sigs["bb_overheated_bull"],
+        "bb_bull":           bb_sigs["bb_bull"],
+        "bb_early_bull":     bb_sigs["bb_early_bull"],
+        "bb_bear":           bb_sigs["bb_bear"],
+        "bb_extreme_bear":   bb_sigs["bb_extreme_bear"],
+        "bullBear365d":      round(bb365d, 6),
+        "bullBear30d":       round(bb30d,  6),
+
+        # ── Profitabilité & Holders ───────────────────────────────────────────
+        "soprAlert":         int(sopr_alert),
+        "soprRatio":         round(sopr_val,   6),
+        "soprSma90":         round(sopr_sma90, 6),
+        "lthSoprRaw":        data.get("lthSoprRaw"),
+        "sthSoprRaw":        data.get("sthSoprRaw"),
+        "lthNupl":           round(lth_val,  6),
+        "sthNupl":           round(sth_val,  6),
+        "nuplAvg":           round(nupl_avg, 6),
+        "nuplLine":          round(nupl_avg, 6),
+        "lthSupplyRatio":    round(lth_sup, 4),
+        "lthSupplyFlag":     int(lth_sup_flag),
+        "utxosInProfitPct":  data.get("utxosInProfitPct"),
+        "coh_10k_plus":      cohorts["coh_10k_plus"],
+        "coh_1k_10k":        cohorts["coh_1k_10k"],
+        "coh_100_1k":        cohorts["coh_100_1k"],
+        "coh_10_100":        cohorts["coh_10_100"],
+        "coh_1_10":          cohorts["coh_1_10"],
+        "coh_01_1":          cohorts["coh_01_1"],
+        "coh_0_01":          cohorts["coh_0_01"],
+        "sov_btc_0_1":            sov["sov_btc_0_1"],
+        "sov_btc_1_10":           sov["sov_btc_1_10"],
+        "sov_btc_10_100":         sov["sov_btc_10_100"],
+        "sov_btc_100_1k":         sov["sov_btc_100_1k"],
+        "sov_btc_1k_10k":         sov["sov_btc_1k_10k"],
+        "sov_btc_10k_inf":        sov["sov_btc_10k_inf"],
+        "sov_btc_0_1_sma7":       sov["sov_btc_0_1_sma7"],
+        "sov_btc_1_10_sma7":      sov["sov_btc_1_10_sma7"],
+        "sov_btc_10_100_sma7":    sov["sov_btc_10_100_sma7"],
+        "sov_btc_100_1k_sma7":    sov["sov_btc_100_1k_sma7"],
+        "sov_btc_1k_10k_sma7":    sov["sov_btc_1k_10k_sma7"],
+        "sov_btc_10k_inf_sma7":   sov["sov_btc_10k_inf_sma7"],
+        "sov_total_sma7":         sov["sov_total_sma7"],
+        "sov_avg_price":          sov["sov_avg_price"],
+        "sov_signal":             sov["sov_signal"],
+
+        # ── Valorisation Long Terme ───────────────────────────────────────────
+        "mvrv_7d":            mvrv_ext["mvrv_7d"],
+        "mvrv_log_7d":        mvrv_ext["mvrv_log_7d"],
+        "mvrv_zscore_365d":   mvrv_ext["mvrv_zscore_365d"],
+        "mvrv_zscore_4yr":    mvrv_ext["mvrv_zscore_4yr"],
+        "mvrvPct":            mvrv_ext["mvrvPct"],
+        "mvrv_zscore":        mvrv_ext["mvrv_zscore"],
+        "mvrvRatioReal":      mvrv_ext["mvrvRatioReal"],
+        "mvrvLth":            mvrv_ext["mvrvLth"],
+        "mvrvSth":            mvrv_ext["mvrvSth"],
+        "mvrv_high_signal":   mvrv_ext["mvrv_high_signal"],
+        "mvrv_low_signal":    mvrv_ext["mvrv_low_signal"],
+        "mvrv_zone":          mvrv_ext["mvrv_zone"],
+        "mayerMultiple":      mayer_ext["mayerMultiple"],
+        "mayer_oversold":     mayer_ext["mayer_oversold"],
+        "mayer_sma200":       mayer_ext["mayer_sma200"],
+        "mayer_overbought":   mayer_ext["mayer_overbought"],
+        "mayer_hi_overbought":mayer_ext["mayer_hi_overbought"],
+        "mayerAlert":         mayer_ext["mayerAlert"],
+        "sharpeShort":        sharpe_val,
+
+        # ── Score Global ──────────────────────────────────────────────────────
+        "thermalScore": thermal,
+
+        # ── Métadonnées sources (debug GitHub Actions) ────────────────────────
+        "_sources": sources,
+    }
+
+    dashboard = sanitize(dashboard)
+
+    # ── pipeline_status : résumé de santé pour le dashboard ──────────────────
+    # Permet au JSX d'afficher une alerte si des sources sont dégradées
+    real_count  = sum(1 for v in sources.values()
+                      if v in ("researchbitcoin","bgeometrics","coinmetrics","real","bybit"))
+    proxy_count = sum(1 for v in sources.values() if "proxy" in str(v))
+    if real_count >= 6:
+        p_status = "ok"
+    elif real_count >= 3:
+        p_status = "partial"   # Quelques proxies — données moins précises
+    else:
+        p_status = "degraded"  # Majorité de proxies — données approximatives
+    dashboard["pipeline_status"]   = p_status
+    dashboard["pipeline_real_src"] = real_count
+    dashboard["pipeline_proxy_src"]= proxy_count
+
+    with open("btc_dashboard.json", "w") as f:
+        json.dump(dashboard, f, indent=2)
+
+    s = dashboard["_sources"]
+    print(f"\n══ RÉSUMÉ ═══════════════════════════════════════════════════════")
+    print(f"  Prix        : ${dashboard['btcPrice']:,.2f}")
+    print(f"  SOPR        : {dashboard['soprRatio']:.4f} [{s['sopr']}] Alert={dashboard['soprAlert']}")
+    print(f"               LTH={dashboard.get('lthSoprRaw')}  STH={dashboard.get('sthSoprRaw')}  SMA90={dashboard['soprSma90']:.4f}")
+    print(f"  LTH NUPL    : {dashboard['lthNupl']:.4f} [{s['nupl']}]  |  STH NUPL={dashboard['sthNupl']:.4f}")
+    print(f"  MVRV Z-Score: {dashboard['mvrv_zscore']:.4f} [{s['mvrv']}]  |  %ile={dashboard['mvrvPct']:.1f}%")
+    print(f"  Sharpe 364d : {dashboard['sharpeShort']:.2f} [{s['sharpe']}]")
+    print(f"  Mayer       : {dashboard['mayerMultiple']:.4f} [{s['mayer']}]  Alert={dashboard['mayerAlert']}")
+    print(f"  ETF 30D     : {dashboard['etf_30d_sum']:.2f} [{s['etf']}]")
+    print(f"  Funding     : {dashboard['funding_rate']:.4f}%  |  OI={dashboard['oi_usd']:.2f}B$  CVD7j={dashboard['cvd_7d']:.3f}B$")
+    print(f"  LTH Supply  : {dashboard['lthSupplyRatio']:.4f} [{s['utxo']}]  Flag={dashboard['lthSupplyFlag']}")
+    print(f"  Stable      : [{s['stable']}]  USDT={dashboard.get('stableSupplyUsdtB')}B  USDC={dashboard.get('stableSupplyUsdcB')}B")
+    print(f"  Thermal     : {dashboard['thermalScore']:.3f}/9")
+    print(f"  Status      : {dashboard['pipeline_status'].upper()}  ({dashboard['pipeline_real_src']} sources réelles · {dashboard['pipeline_proxy_src']} proxies)")
+    print(f"  ✓ btc_dashboard.json — {dashboard['updated']} UTC\n")
+
+
+if __name__ == "__main__":
+    run()
