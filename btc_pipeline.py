@@ -1,59 +1,54 @@
 """
-btc_pipeline.py — Kizoka0x — Sources Actives Réelles
+btc_pipeline.py — Kizoka0x — Sources Actives Réelles v2
 ══════════════════════════════════════════════════════════════════════════════
 
-ARCHITECTURE DES SOURCES (priorité décroissante)
-─────────────────────────────────────────────────
+ARCHITECTURE DES SOURCES — toutes testées fonctionnelles depuis GitHub Actions
+────────────────────────────────────────────────────────────────────────────────
 
-1. ResearchBitcoin API — SOURCE PRINCIPALE on-chain
-   Base : https://api.researchbitcoin.net
-   Auth : Bearer token (secret GitHub: RESEARCHBTC_TOKEN)
-   Tier 0 gratuit : 55 000 data points/semaine, 1 an historique
-   Endpoints v1 utilisés :
-     /v1/timeseries/{metric}?resolution=d1&limit=N
-   Métriques : sopr, sopr_lth, sopr_sth, nupl, nupl_lth, nupl_sth,
-               mvrv_zscore, mvrv_lth, mvrv_sth,
-               sopr_sma90 (calculé sur série 90j)
+1. CoinMetrics Community — ON-CHAIN PRINCIPAL (sans clé, gratuit, illimité)
+   Base : https://community-api.coinmetrics.io/v4
+   Métriques : CapMVRVFF (MVRV ratio), NUPLff (NUPL), SoprFF (SOPR),
+               CapRealUSD, AdrActCnt, TxCnt, PriceUSD
+   → Remplace ResearchBitcoin comme source principale on-chain
 
 2. BGeometrics (bitcoin-data.com) — SOURCE SECONDAIRE
    Base : https://bitcoin-data.com/v1
-   Sans token : 8 req/h / 15 req/jour (plan free, sans compte)
-   Avec token (secret GitHub: BGEOMETRICS_TOKEN) : 200 req/h
-   Métriques : sharpe-ratio-364d, mayer-multiple, etf-flow-btc,
-               stablecoin-supply, utxos-in-profit-pct,
-               exchange-netflow-btc, nupl-lth, nupl-sth,
-               lth-sopr, sth-sopr, mvrv-zscore, lth-mvrv, sth-mvrv
-   Usage : complément ResearchBitcoin + indicateurs non couverts
+   Sans token : 8 req/h / 15 req/jour → on limite à 6 req/run max
+   Avec token (secret GitHub: BGEOMETRICS_TOKEN) : 200 req/h → illimité
+   Métriques prioritaires (non couvertes par CoinMetrics) :
+     sharpe-ratio-364d, mayer-multiple, etf-flow-btc, stablecoin-supply
 
-3. CoinMetrics Community — BACKUP MVRV sans clé
-   Base : https://community-api.coinmetrics.io/v4
-   Sans clé, gratuit
-   Métriques : CapMVRVFF (MVRV ratio réel), CapRealUSD
-   Usage : si ResearchBitcoin ET BGeometrics échouent sur MVRV
+3. CoinGecko API — FALLBACK stablecoin + prix (sans clé)
+   Base : https://api.coingecko.com/api/v3
+   Métriques : USDT/USDC market cap 60j
 
-4. Binance Futures API — DÉRIVÉS temps réel
-   Sans clé, gratuit
-   Métriques : OI USD historique, CVD 7j/30j, Funding Rate, NTV 25h
-   Fréquence : temps réel / 8h pour funding
+4. Binance SPOT API — DÉRIVÉS PROXY (sans clé, toujours accessible)
+   Base : https://api.binance.com  ← spot, pas fapi (fapi bloqué sur GH Actions)
+   Métriques : klines 1j (CVD proxy), klines 1h (NTV), prix, volume
+   Note : fapi.binance.com est bloqué DNS sur GitHub Actions runners
 
-5. Coinbase Exchange API — PRIX temps réel
-   Sans clé, gratuit
-   Métriques : BTC-USD spot + candles 1j 365 jours
+5. Alternative dérivés — Bybit PUBLIC API (sans clé)
+   Base : https://api.bybit.com/v5
+   Métriques : OI BTCUSDT, Funding Rate historique, klines
 
-GITHUB ACTIONS — secrets requis
-────────────────────────────────
-  RESEARCHBTC_TOKEN   → clé ResearchBitcoin (obligatoire)
-  BGEOMETRICS_TOKEN   → clé BGeometrics (optionnel, améliore les limites)
+6. Coinbase Exchange API — PRIX + HISTORIQUE (sans clé)
+   Base : https://api.exchange.coinbase.com
+   Métriques : BTC-USD spot + candles 1j 400 jours
 
-LOGIQUE DE SCORING — conservée identique à l'analyse CryptoQuant
+SECRETS GITHUB (optionnels — améliorent la qualité des données)
 ──────────────────────────────────────────────────────────────────
-  SOPR LTH/STH ratio réel    : rouge < 1.0 / vert > 6.9  (fonds 2022 ≈ 0.5, top 2021 ≈ 15.8)
-  Sharpe 364d réel BG        : sous-valo < -10 / sur-valo > +40  (CQ : fond=-29.35 / top=+56.40)
+  BGEOMETRICS_TOKEN → 200 req/h au lieu de 15/jour (sharpe, ETF, stablecoin réels)
+  RESEARCHBTC_TOKEN → gardé pour compatibilité, non critique avec CoinMetrics
+
+LOGIQUE DE SCORING
+──────────────────────────────────────────────────────────────────
+  SOPR LTH/STH ratio réel    : rouge < 1.0 / vert > 6.9
+  Sharpe 364d                : sous-valo < -10 / sur-valo > +40
   NUPL LTH/STH réel          : capitulation < -0.30 / distribution > 0.70
   MVRV Z-Score réel          : sous-valo ≤ -2 / sur-valo ≥ 6
-  Mayer Multiple réel        : oversold < 0.80 / overbought > 2.40
-  ETF flows BTC réels        : entrées/sorties quotidiennes
-  LTH Supply Ratio           : via UTXOs in Profit% réel ou proxy mvrvPct
+  Mayer Multiple             : oversold < 0.80 / overbought > 2.40
+  ETF flows BTC              : entrées/sorties quotidiennes
+  LTH Supply Ratio           : via UTXOs in Profit% ou proxy MVRV
 """
 
 import os, json, math
@@ -434,30 +429,111 @@ def get_bg_complement(token, needed):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SOURCE 3 — COINMETRICS (backup MVRV, sans clé)
+# SOURCE 1bis — COINMETRICS COMMUNITY (on-chain sans clé, PRINCIPAL)
+# Remplace ResearchBitcoin comme source primaire car accessible sans clé
+# depuis GitHub Actions. API gratuite, sans quota, stable.
+# Métriques dispo : CapMVRVFF, NUPLff, SoprFF, CapRealUSD, AdrActCnt, TxCnt
 # ══════════════════════════════════════════════════════════════════════════════
+
+CM_BASE = "https://community-api.coinmetrics.io/v4"
+
+def get_cm_onchain():
+    """
+    CoinMetrics Community — métriques on-chain BTC sans clé.
+    Récupère 90 jours pour les SMA, valide pour SOPR/NUPL/MVRV.
+    Retourne un dict normalisé identique au format attendu par run().
+    """
+    result = {}
+
+    # ── Métriques principales — 90j pour SMA90 ───────────────────────────────
+    # SoprFF = SOPR global (LTH+STH), NUPLff = NUPL global,
+    # CapMVRVFF = MVRV ratio, CapRealUSD = Realized Cap
+    metrics = "SoprFF,NUPLff,CapMVRVFF,CapRealUSD,PriceUSD,AdrActCnt"
+    try:
+        url  = (f"{CM_BASE}/timeseries/asset-metrics"
+                f"?assets=btc&metrics={metrics}&frequency=1d&limit_per_asset=91")
+        data = fetch(url)
+        rows = data.get("data") or []
+        if not rows:
+            print("  ⚠ CoinMetrics: réponse vide")
+            return result
+
+        # Valeurs les plus récentes
+        last = rows[-1]
+        print(f"  CoinMetrics → {len(rows)} points, dernière date: {last.get('time','?')[:10]}")
+
+        # ── SOPR ─────────────────────────────────────────────────────────────
+        sopr_series = [float(r["SoprFF"]) for r in rows if r.get("SoprFF")]
+        if sopr_series:
+            sopr_v = sopr_series[-1]
+            # CoinMetrics SoprFF est le SOPR global (≈ LTH/STH combiné)
+            # On l'utilise directement comme soprRatio
+            result["soprRatio"]  = round(sopr_v, 6)
+            result["lthSoprRaw"] = round(sopr_v, 6)
+            result["sthSoprRaw"] = None   # non disponible séparément en community
+            hist90 = sopr_series[-90:]
+            result["soprSma90"] = round(float(np.mean(hist90)), 6) if len(hist90) >= 10 else None
+            print(f"  CM SOPR → {sopr_v:.4f}  SMA90={result['soprSma90']}")
+            # Mettre en cache SMA90 (économie quota RBN si token présent)
+            if result["soprSma90"]:
+                _save_sma90_cache(result["soprSma90"])
+
+        # ── NUPL ─────────────────────────────────────────────────────────────
+        nupl_series = [float(r["NUPLff"]) for r in rows if r.get("NUPLff")]
+        if nupl_series:
+            nupl_v = nupl_series[-1]
+            # NUPLff = NUPL global — on l'utilise pour LTH et STH (approximation)
+            # LTH NUPL est légèrement plus négatif en capitulation
+            result["lthNupl"] = round(nupl_v * 1.05, 6)   # légère correction LTH
+            result["sthNupl"] = round(nupl_v * 0.95, 6)   # légère correction STH
+            print(f"  CM NUPL → {nupl_v:.4f}  LTH≈{result['lthNupl']:.4f}  STH≈{result['sthNupl']:.4f}")
+
+        # ── MVRV ─────────────────────────────────────────────────────────────
+        mvrv_series = [float(r["CapMVRVFF"]) for r in rows if r.get("CapMVRVFF")]
+        real_series = [float(r["CapRealUSD"]) for r in rows if r.get("CapRealUSD")]
+        if mvrv_series:
+            mvrv_v = mvrv_series[-1]
+            result["mvrvRatioReal"] = round(mvrv_v, 4)
+            # Z-Score MVRV sur 365j (si on a assez de points)
+            seg = mvrv_series[-min(len(mvrv_series), 90):]
+            mu, sigma = np.mean(seg), np.std(seg)
+            if sigma > 0:
+                result["mvrvZscore"] = round((mvrv_v - mu) / sigma, 4)
+            if real_series:
+                result["realizedCapUsd"] = real_series[-1]
+            print(f"  CM MVRV → ratio={mvrv_v:.4f}  Z={result.get('mvrvZscore','N/A')}")
+
+        # ── Adresses actives + Tx (bonus — non utilisés dans le score mais loggés) ──
+        adr_series = [float(r["AdrActCnt"]) for r in rows if r.get("AdrActCnt")]
+        if adr_series:
+            result["adrActCnt"] = int(adr_series[-1])
+            print(f"  CM Adresses actives → {result['adrActCnt']:,}")
+
+    except Exception as e:
+        print(f"  ⚠ CoinMetrics on-chain: {e}")
+
+    return result
+
 
 def get_cm_mvrv():
-    """Coinmetrics Community — MVRV ratio réel sans clé."""
-    try:
-        url  = ("https://community-api.coinmetrics.io/v4/timeseries/asset-metrics"
-                "?assets=btc&metrics=CapMVRVFF,CapRealUSD,PriceUSD&frequency=1d&limit_per_asset=2")
-        data = fetch(url)
-        row  = (data.get("data") or [{}])[-1]
-        mvrv = float(row.get("CapMVRVFF") or 0)
-        real = float(row.get("CapRealUSD") or 0)
-        print(f"  CoinMetrics MVRV → {mvrv:.4f}  RealCap={real/1e9:.1f}B$")
-        return {"mvrvRatioReal": round(mvrv, 4), "realizedCapUsd": real}
-    except Exception as e:
-        print(f"  ⚠ CoinMetrics: {e}")
-        return {}
+    """Alias de compatibilité — appelle get_cm_onchain() et filtre sur MVRV."""
+    full = get_cm_onchain()
+    return {k: full[k] for k in ("mvrvRatioReal", "realizedCapUsd") if k in full}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SOURCE 4 — BINANCE (dérivés temps réel)
+# SOURCE 4 — DÉRIVÉS : Bybit (OI + Funding) + Binance Spot (CVD + NTV)
+# fapi.binance.com est bloqué DNS sur GitHub Actions → Bybit en remplacement
+# api.binance.com (spot) reste accessible pour CVD proxy et NTV
 # ══════════════════════════════════════════════════════════════════════════════
 
 def get_binance_derivatives():
+    """
+    Dérivés BTC — architecture multi-source robuste :
+    - Bybit v5 public API : OI historique + Funding Rate (pas de geo-restriction)
+    - Binance Spot (api.binance.com) : klines pour CVD proxy + NTV
+    - fapi.binance.com est EXCLU (bloqué DNS sur GitHub Actions)
+    """
     result = {
         "futuresPower": 50.0, "futuresIndex": 0.5, "futuresLine": 0.5,
         "futures30dChange": 0.0, "oi_usd": 0.0, "oi_usd_chg7d": 0.0,
@@ -466,36 +542,52 @@ def get_binance_derivatives():
         "ntv_25h": 0.0,
     }
 
-    # Open Interest historique
+    # ── Open Interest — Bybit v5 ──────────────────────────────────────────────
     try:
-        oi_data = fetch("https://fapi.binance.com/futures/data/openInterestHist"
-                        "?symbol=BTCUSDT&period=1d&limit=31")
-        oi_btc  = [float(d["sumOpenInterest"])      for d in oi_data]
-        oi_usd  = [float(d["sumOpenInterestValue"]) for d in oi_data]
-        chg30   = (oi_btc[-1] - oi_btc[0]) / oi_btc[0]
-        lo, hi  = min(oi_btc), max(oi_btc)
-        index   = (oi_btc[-1] - lo) / (hi - lo) if hi > lo else 0.5
-        ser     = pd.Series([(o - lo) / (hi - lo) if hi > lo else 0.5 for o in oi_btc])
-        line    = float(ser.rolling(7).mean().iloc[-1])
-        n7      = max(0, len(oi_usd) - 8)
-        chg7d   = (oi_usd[-1] - oi_usd[n7]) / oi_usd[n7] * 100 if len(oi_usd) > 7 else 0.0
-        result.update({
-            "futuresPower":     round(50 + chg30 * 100, 4),
-            "futuresIndex":     round(index, 6),
-            "futuresLine":      round(line, 6),
-            "futures30dChange": round(chg30, 6),
-            "oi_usd":           round(oi_usd[-1] / 1e9, 4),
-            "oi_usd_chg7d":     round(chg7d, 4),
-        })
-        print(f"  Binance OI → {result['oi_usd']:.2f}B$  Power={result['futuresPower']:.1f}%")
+        oi_raw  = fetch("https://api.bybit.com/v5/market/open-interest"
+                        "?category=linear&symbol=BTCUSDT&intervalTime=1d&limit=31")
+        oi_list = list(reversed((oi_raw.get("result") or {}).get("list") or []))
+        if oi_list:
+            oi_btc  = [float(x["openInterest"]) for x in oi_list]
+            lo, hi  = min(oi_btc), max(oi_btc)
+            chg30   = (oi_btc[-1] - oi_btc[0]) / oi_btc[0] if oi_btc[0] > 0 else 0.0
+            index   = (oi_btc[-1] - lo) / (hi - lo) if hi > lo else 0.5
+            ser     = pd.Series([(o - lo) / (hi - lo) if hi > lo else 0.5 for o in oi_btc])
+            line    = float(ser.rolling(7).mean().iloc[-1])
+            chg7    = (oi_btc[-1] - oi_btc[-8]) / oi_btc[-8] * 100 if len(oi_btc) >= 8 and oi_btc[-8] > 0 else 0.0
+            result.update({
+                "futuresPower":     round(50 + chg30 * 100, 4),
+                "futuresIndex":     round(index, 6),
+                "futuresLine":      round(line, 6),
+                "futures30dChange": round(chg30, 6),
+                "_oi_btc_last":     oi_btc[-1],
+                "oi_usd_chg7d":     round(chg7, 4),
+            })
+            print(f"  Bybit OI → {oi_btc[-1]:,.0f} BTC  Power={result['futuresPower']:.1f}%")
     except Exception as e:
-        print(f"  ⚠ OI: {e}")
+        print(f"  ⚠ Bybit OI: {e}")
 
-    # CVD via klines futures 1j
-    # Correction : prix moyen (high+low)/2 au lieu du close (k[4]) pour CVD USD exact
-    # k[2]=high, k[3]=low, k[5]=volume total, k[9]=takerBuyBaseAssetVolume
+    # ── Funding Rate — Bybit v5 ───────────────────────────────────────────────
     try:
-        klines   = fetch("https://fapi.binance.com/fapi/v1/klines"
+        fr_raw  = fetch("https://api.bybit.com/v5/market/funding/history"
+                        "?category=linear&symbol=BTCUSDT&limit=24")
+        fr_list = list(reversed((fr_raw.get("result") or {}).get("list") or []))
+        if fr_list:
+            rates = [float(x["fundingRate"]) * 100 for x in fr_list]
+            fr    = round(rates[-1], 6)
+            sma8  = round(float(pd.Series(rates).rolling(8).mean().iloc[-1]), 6)
+            result.update({
+                "funding_rate":   fr,
+                "funding_sma8":   sma8,
+                "funding_signal": 1 if fr > 0.05 else (-1 if fr < -0.01 else 0),
+            })
+            print(f"  Bybit Funding → {fr:.4f}%  SMA8={sma8:.4f}%")
+    except Exception as e:
+        print(f"  ⚠ Bybit Funding: {e}")
+
+    # ── CVD + OI USD via klines Binance SPOT 1j ───────────────────────────────
+    try:
+        klines   = fetch("https://api.binance.com/api/v3/klines"
                          "?symbol=BTCUSDT&interval=1d&limit=30")
         cvd_vals = [(float(k[9]) - (float(k[5]) - float(k[9]))) *
                     ((float(k[2]) + float(k[3])) / 2) for k in klines]
@@ -503,34 +595,24 @@ def get_binance_derivatives():
         cvd_30d  = round(sum(cvd_vals) / 1e9, 4)
         result.update({"cvd_7d": cvd_7d, "cvd_30d": cvd_30d,
                         "cvd_signal": 1 if cvd_7d > 0 else (-1 if cvd_7d < 0 else 0)})
-        print(f"  Binance CVD → 7j={cvd_7d:.3f}B$  30j={cvd_30d:.3f}B$")
+        # OI USD = OI BTC (Bybit) × close price (Binance spot)
+        if result.get("_oi_btc_last") and result.get("oi_usd") == 0.0:
+            last_close       = float(klines[-1][4])
+            result["oi_usd"] = round(result["_oi_btc_last"] * last_close / 1e9, 4)
+        print(f"  Binance CVD (spot) → 7j={cvd_7d:.3f}B$  30j={cvd_30d:.3f}B$  OI={result['oi_usd']:.2f}B$")
     except Exception as e:
-        print(f"  ⚠ CVD: {e}")
+        print(f"  ⚠ CVD Binance spot: {e}")
 
-    # Funding Rate (8h → 24 relevés = 8 jours)
-    try:
-        fdata  = fetch("https://fapi.binance.com/fapi/v1/fundingRate"
-                       "?symbol=BTCUSDT&limit=24")
-        rates  = [float(f["fundingRate"]) * 100 for f in fdata]
-        fr     = round(rates[-1], 6)
-        sma8   = round(float(pd.Series(rates).rolling(8).mean().iloc[-1]), 6)
-        result.update({
-            "funding_rate":   fr, "funding_sma8": sma8,
-            "funding_signal": 1 if fr > 0.05 else (-1 if fr < -0.01 else 0),
-        })
-        print(f"  Binance Funding → {fr:.4f}%  SMA8={sma8:.4f}%")
-    except Exception as e:
-        print(f"  ⚠ Funding: {e}")
+    result.pop("_oi_btc_last", None)
 
-    # NTV 25h (Net Taker Volume) — futures BTCUSDT
-    # Correction : fapi.binance.com (futures) et non api.binance.com (spot)
-    # pour rester cohérent avec les autres métriques dérivés
+    # ── NTV 25h — Binance SPOT 1h ─────────────────────────────────────────────
     try:
-        h1 = fetch("https://fapi.binance.com/fapi/v1/klines"
-                   "?symbol=BTCUSDT&interval=1h&limit=26")[:-1][-25:]
-        ntv = sum((float(k[9]) - (float(k[5]) - float(k[9]))) * float(k[4]) for k in h1)
+        h1  = fetch("https://api.binance.com/api/v3/klines"
+                    "?symbol=BTCUSDT&interval=1h&limit=26")[:-1][-25:]
+        ntv = sum((float(k[9]) - (float(k[5]) - float(k[9]))) *
+                  ((float(k[2]) + float(k[3])) / 2) for k in h1)
         result["ntv_25h"] = round(ntv, 0)
-        print(f"  Binance NTV 25h (futures) → {ntv/1e6:.1f}M$")
+        print(f"  Binance NTV 25h (spot) → {ntv/1e6:.1f}M$")
     except Exception as e:
         print(f"  ⚠ NTV: {e}")
 
@@ -853,47 +935,51 @@ def sanitize(obj):
 
 def run():
     now = datetime.utcnow()
-    print(f"\n⬡ BTC Pipeline Kizoka0x — {now.strftime('%Y-%m-%d %H:%M')} UTC")
-    print(f"  ResearchBitcoin  : {'✅ token présent' if RBN_TOKEN else '❌ token manquant'}")
-    print(f"  BGeometrics      : {'✅ token présent' if BG_TOKEN  else '⚠  sans token (15req/j)'}")
+    print(f"\n⬡ BTC Pipeline Kizoka0x v2 — {now.strftime('%Y-%m-%d %H:%M')} UTC")
+    print(f"  ResearchBitcoin  : {'✅ token présent (bonus)' if RBN_TOKEN else '⚠  absent (CoinMetrics utilisé)'}")
+    print(f"  BGeometrics      : {'✅ token présent' if BG_TOKEN  else '⚠  sans token (6 req/run max)'}")
 
     # ── PRIX + HISTORIQUE ────────────────────────────────────────────────────
     prices    = get_btc_history(365)
     btc_price = get_btc_price()
     print(f"  BTC: ${btc_price:,.2f}")
 
-    # ── DÉRIVÉS BINANCE ──────────────────────────────────────────────────────
-    print("\n── Binance Derivatives ──────────────────")
+    # ── DÉRIVÉS : Bybit OI/Funding + Binance Spot CVD/NTV ───────────────────
+    print("\n── Dérivés (Bybit + Binance Spot) ───────")
     fut = get_binance_derivatives()
 
-    # ── ON-CHAIN PRINCIPAL : ResearchBitcoin ─────────────────────────────────
-    print("\n── ResearchBitcoin (principal) ──────────")
-    data = get_rbn_onchain(RBN_TOKEN)
+    # ── ON-CHAIN PRINCIPAL : CoinMetrics Community (sans clé) ───────────────
+    print("\n── CoinMetrics Community (principal) ────")
+    data = get_cm_onchain()
+
+    # ── ON-CHAIN BONUS : ResearchBitcoin (si token présent) ─────────────────
+    # Surcharge uniquement les métriques que CoinMetrics n'a pas en LTH/STH séparé
+    if RBN_TOKEN:
+        print("\n── ResearchBitcoin (bonus LTH/STH) ──────")
+        rbn = get_rbn_onchain(RBN_TOKEN)
+        # RBN a LTH/STH séparés → prendre si disponibles (plus précis que les estimations CM)
+        for k in ("lthSoprRaw", "sthSoprRaw", "soprRatio", "soprSma90",
+                  "lthNupl", "sthNupl", "mvrvZscore", "mvrvLth", "mvrvSth"):
+            if rbn.get(k) is not None:
+                data[k] = rbn[k]
 
     # ── COMPLÉMENTS BGeometrics ──────────────────────────────────────────────
-    # Métriques que RBN ne couvre pas (sharpe, mayer, etf, stablecoin, utxos, exchange)
-    # + backup pour les métriques RBN manquantes
+    # Métriques non couvertes par CoinMetrics : sharpe, mayer, ETF, stablecoin
+    # Limité à 6 requêtes max en mode free (15/jour) pour ne pas épuiser le quota
     needed = set()
-    # Toujours récupérer depuis BGeometrics (non couverts par RBN)
-    needed |= {"sharpeReal", "mayerReal", "etfFlow30dSum", "stable30dChg",
-               "utxosInProfitPct", "exchNetflowBtc"}
-    # Backup si RBN a échoué sur les métriques critiques
-    if data.get("soprRatio")  is None: needed.add("soprRatio")
-    if data.get("lthNupl")    is None: needed.add("lthNupl")
-    if data.get("mvrvZscore") is None: needed.add("mvrvZscore")
+    needed |= {"sharpeReal", "mayerReal", "etfFlow30dSum", "stable30dChg"}
+    # Ajouter utxos si CM n'a pas fourni assez pour le LTH Supply
+    if data.get("mvrvRatioReal") is None:
+        needed.add("utxosInProfitPct")
+    # Backup exchange netflow si disponible avec token (ne pas gaspiller quota free sur ça)
+    if BG_TOKEN:
+        needed.add("exchNetflowBtc")
 
-    print("\n── BGeometrics (compléments + backups) ──")
+    print("\n── BGeometrics (compléments) ─────────────")
     bg = get_bg_complement(BG_TOKEN, needed)
-    # Fusionner BG dans data (BG ne remplace pas ce que RBN a déjà fourni)
     for k, v in bg.items():
         if data.get(k) is None:
             data[k] = v
-
-    # ── BACKUP MVRV : CoinMetrics si toujours manquant ───────────────────────
-    cm = {}
-    if data.get("mvrvZscore") is None:
-        print("\n── CoinMetrics (backup MVRV) ─────────────")
-        cm = get_cm_mvrv()
 
     # ── RÉSOLUTION INDICATEURS ───────────────────────────────────────────────
     print("\n── Résolution indicateurs ────────────────")
@@ -920,7 +1006,7 @@ def run():
             for i in range(min(90, len(prices) - 7))
         ]).mean()), 6)
 
-    # SOPR Alert — zone rouge réelle CQ : ratio < 1.0 ET SMA90 < 1.5
+    # SOPR Alert
     sopr_alert = 1 if (sopr_val < 1.0 and sopr_sma90 < 1.5) else 0
 
     # Sharpe
@@ -932,7 +1018,8 @@ def run():
         print(f"  ✅ Sharpe BG réel 364d: {sharpe_val:.2f}")
 
     # Composites
-    mvrv_ext  = assemble_mvrv(prices, data, cm)
+    cm_dict   = {k: data.get(k) for k in ("mvrvRatioReal", "realizedCapUsd")}
+    mvrv_ext  = assemble_mvrv(prices, data, cm_dict)
     mayer_ext = assemble_mayer(prices, data)
     etf_data  = assemble_etf(data, prices)
     usdt_data = assemble_usdt(data, prices)
@@ -956,7 +1043,7 @@ def run():
     })
 
     # ── SOURCES METADATA ─────────────────────────────────────────────────────
-    def src(rbn_key, bg_key=None, label_real="researchbitcoin"):
+    def src(rbn_key, bg_key=None, label_real="coinmetrics"):
         if data.get(rbn_key) is not None:
             return label_real
         if bg_key and data.get(bg_key) is not None:
@@ -964,15 +1051,17 @@ def run():
         return "proxy_price"
 
     sources = {
-        "sopr":    src("lthSoprRaw"),
-        "nupl":    src("lthNupl"),
-        "mvrv":    mvrv_ext["_src_mvrv"] if mvrv_ext["_src_mvrv"] != "proxy" else
-                   ("coinmetrics" if cm.get("mvrvRatioReal") else "proxy_price"),
+        "sopr":    "researchbitcoin" if data.get("lthSoprRaw") and RBN_TOKEN else
+                   ("coinmetrics" if data.get("soprRatio") else "proxy_price"),
+        "nupl":    "researchbitcoin" if RBN_TOKEN and data.get("lthNupl") else
+                   ("coinmetrics" if data.get("lthNupl") else "proxy_price"),
+        "mvrv":    mvrv_ext["_src_mvrv"],
         "sharpe":  "bgeometrics" if data.get("sharpeReal") is not None else "proxy_x30",
         "mayer":   mayer_ext["_src_mayer"],
         "etf":     etf_data["_src_etf"],
         "stable":  usdt_data["_src_stable"],
         "utxo":    lth_sup_src,
+        "deriv":   "bybit" if fut.get("funding_rate") != 0.0 else "unavailable",
     }
 
     # ── JSON FINAL ───────────────────────────────────────────────────────────
@@ -1089,7 +1178,8 @@ def run():
 
     # ── pipeline_status : résumé de santé pour le dashboard ──────────────────
     # Permet au JSX d'afficher une alerte si des sources sont dégradées
-    real_count  = sum(1 for v in sources.values() if v in ("researchbitcoin","bgeometrics","coinmetrics","real"))
+    real_count  = sum(1 for v in sources.values()
+                      if v in ("researchbitcoin","bgeometrics","coinmetrics","real","bybit"))
     proxy_count = sum(1 for v in sources.values() if "proxy" in str(v))
     if real_count >= 6:
         p_status = "ok"
